@@ -297,7 +297,7 @@ impl Engine {
                 }
             };
 
-            if let Some(kind) = kind {
+            if let Some(kind) = kind.filter(|_| !is_bl) {
                 self.alerts.push_back(Alert {
                     at: now,
                     clock: clock.clone(),
@@ -482,6 +482,19 @@ mod tests {
         assert_eq!(out.active.len(), 1);
         assert_eq!(out.active[0].symbol, "OK");
         assert_eq!(out.blacklisted[0].symbol, "BL");
+    }
+
+    #[test]
+    fn blacklisted_symbols_raise_no_alerts() {
+        let mut cfg = Config::default();
+        cfg.max_market_cap = 0.0;
+        cfg.blacklisted_tickers = vec!["BL".into()];
+        let mut e = Engine::new(&cfg);
+        let out = e.process(vec![tk("BL", 1.0, 1000, 0.1, 0.0)], "change", true, Instant::now());
+        assert_eq!(out.new_alerts, 0);
+        assert!(e.alerts.is_empty());
+        assert_eq!(out.blacklisted[0].symbol, "BL");
+        assert!(e.last.contains_key("BL"));
     }
 
     #[test]
