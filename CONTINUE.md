@@ -1,69 +1,63 @@
 # Continue here
 
-Handoff for the next session (written 2026-11-16). Read this, then `todo.md`, then `docs/plan.md`.
+Handoff (updated 2026-11-17, after step 19). Read this, then `todo.md`, then `docs/plan.md`.
 
 ## What this is
 
-Rust TUI stock screener (`volume_screener`), a port of the Go `volume_checker_v1.2`. It polls Webull top gainers, raises alerts and renders a highlowtick.com-style dashboard. The current work replaces 5 s polling with Webull's live push stream (WSS) and reworks the features around tick-level data.
+Rust TUI stock screener (`volume_screener`), a port of the Go `volume_checker_v1.2`. It shows Webull top gainers from the live push stream (MQTT over WSS, REST fallback), raises NEW and SETUP alerts and renders a highlowtick.com-style dashboard. `README.md` describes the finished behaviour.
 
-- Repo: `C:\Users\Testweek2\Desktop\Web\TOOLS\volume_screener_rust`, branch `master`, remote https://github.com/noiseparty/rust-screener (**public**).
-- Specs: `docs/plan.md` = user decisions (**authoritative**); `docs/stream-design.md` = reviewed technical design. Where they differ, `plan.md` wins.
-- Task list: `todo.md` (steps 1–6 done, 7–19 open).
+- Repo: `C:\Users\ZX202\kodi\rust-screener`, branch `master`. Not pushed; push only when the user asks. The GitHub remote https://github.com/noiseparty/rust-screener is **public**.
+- Specs: `docs/plan.md` = user decisions (**authoritative**); `docs/stream-design.md` = technical design. Where they differ, `plan.md` wins.
 
-## Where we stopped
+## State
 
-- Steps 1–6 (REST-path bug fixes) are committed and pushed.
-- Step 7 (app home dir `%LOCALAPPDATA%\VolumeScreener\`) was interrupted. Its partial work is in `git stash` ("partial step app-home (interrupted)"). It had added `src/paths.rs` and edited `main.rs`, `config.rs`, `app.rs`, `README.md`. Decide: `git stash pop`, check that it builds and matches plan row 21, then finish and commit; or `git stash drop` and redo.
-- The build workflow was stopped by the user, not by a failure.
+All build steps 1-19 are done and committed (see `todo.md`). `cargo build --release` has 0 warnings and all tests pass. The release exe is `volume_screener.exe` in the project root (gitignored; rebuild with `cargo build --release` and copy `target\release\volume_screener.exe`). Clippy is not installed for the toolchain, so no clippy pass was done (installing it is a `rustup component add` outside the project and needs the user's approval).
 
-## How to resume
+## Untested on screen
 
-1. `git status` must be clean (apart from the stash). Run `cargo build` and `cargo test`; both should pass.
-2. Re-run the build workflow from step 7. Saved script:
-   `C:\Users\Testweek2\.claude\projects\C--Users-Testweek2-Desktop-Web-TOOLS-volume-screener-rust\0665e736-f904-4931-96fb-f3e901274c41\workflows\scripts\stream-rework-build-wf_6ff531bb-2fc.js`
-   - Cached replay (`resumeFromRunId: wf_6ff531bb-2fc`) only works in the same Claude session. In a new session, edit the script's `STEPS` array to remove the six `Fixes` entries, then run it.
-   - Agreed setup: one **Sonnet** agent per step, **sequential** (the steps share `engine.rs` / `app.rs` / `ui.rs` / `config.rs`, so they can't run in parallel). Each step must build with zero warnings and pass tests, then commit locally. Stop on the first failure.
-   - Expect about 2–4 hours for steps 7–19.
-3. The final step builds the release exe and copies it to the project root. **The user must close the running `volume_screener.exe` first** (the file is locked while it runs).
-4. Push to GitHub only when the user asks.
+Only unit tests have run. The TUI and the live stream have not been run against real data in the final build:
+
+- Header indicator, Vol/m column, Mov, dimmed rows, sticky Status badge, rate tabs (`t`), Settings screen with the new fields.
+- NEW / SETUP alerts firing live, including the cooldown.
+- Candle files being written to `%LOCALAPPDATA%\VolumeScreener\data\`, reloaded on restart and purged the next day.
+- Config move from the current directory to the app home on first run.
+- Stream reconnect and REST fallback behaviour over a long session.
+
+## Waiting on the user
+
+1. Run `volume_screener.exe --probe` for a full day (before 11:00 to after 23:00 Riga time) and share `probe\probe-YYYY-MM-DD.csv`.
+2. Use the probe data to check:
+   - `MAX_SUBS = 100` (src/engine.rs) is an assumption; an earlier probe showed 200 subscriptions accepted. Raise or keep the cap accordingly.
+   - The step-9 rule that drops quotes from an older session (series store ingest rules) against what the stream sends at session changes.
+   - Whether the regular-hours price field is right (`close` is used in the regular session and `pPrice` in extended hours; the regular-hours choice is unverified).
+3. Decide whether the public repo should keep the Webull stream details in `docs/`, or become private.
 
 ## Key user decisions (short form; full table in docs/plan.md)
 
-- **SETUP is the main signal.** Keep the user's proven logic: volume ratio ≥ X **and** price change ≥ Y% versus N seconds ago. All three are adjustable (defaults 300 s / 2.2x / +10%).
-- **SPIKE and PUMP alerts are hidden for now.** Keep the enum variants.
-- 2 min alert cooldown; the Status label stays visible during the cooldown and for ≥ 60 s.
-- NEW = joined the gainers list and wasn't on it in the last 30 min; no startup flood.
-- Rate panel tabs, toggled with `t`: **New Highs/Lows** (default) and Up/Down ticks.
-- Recompute/re-rank every 500 or 1000 ms, set in Settings.
-- Mov = rank change on the full board by % change, independent of the user's sort and filters.
-- A row that stops passing a filter stays visible **dimmed for 60 s**, then hides.
-- No installer. Config and data live in `%LOCALAPPDATA%\VolumeScreener\`. 1-minute candles are saved daily, and previous days' files are deleted on launch.
-- Sessions in Riga time (winter): pre 11:00, regular 16:30, after 23:00. Code computes sessions in America/New_York, so DST is automatic.
+- **SETUP is the main signal**: volume ratio >= X **and** price change >= Y% versus N seconds ago (defaults 300 s / 2.2x / +10%).
+- **SPIKE and PUMP alerts are hidden for now.** The enum variants stay.
+- 2 min alert cooldown; Status label held for the cooldown and at least 60 s.
+- NEW = on the gainers list now and not in the last 30 min; no startup flood.
+- Rate panel tabs with `t`: New Highs/Lows (default) and Up/Down ticks.
+- Recompute/re-rank every 500 or 1000 ms. Mov = rank change on the full board. A row that stops passing a filter stays dimmed 60 s.
+- No installer. Config and data in `%LOCALAPPDATA%\VolumeScreener\`; 1-minute candles saved daily, previous days deleted on launch.
+- Sessions in Riga winter time: pre 11:00, regular 16:30, after 23:00; code uses America/New_York so DST is automatic.
 
 ## Stream facts (verified live)
 
-`wss://wspush.webullfintech.com:443/mqtt`, subprotocol `mqtt`, `Origin: https://webull.com`, MQTT 3.1.1, user/pass `test`/`test`.
-1. Subscribe to the header topic first.
-2. Then subscribe to `{"tickerIds":[...],"type":"102","flag":"1"}`.
+`wss://wspush.webullfintech.com:443/mqtt`, subprotocol `mqtt`, `Origin: https://webull.com`, MQTT 3.1.1, user/pass `test`/`test`. Subscribe to the header topic first, then to `{"tickerIds":[...],"type":"102","flag":"1"}`. Payload is protobuf `ItemsCombo`; the field map is in `docs/plan.md`.
 
-The payload is protobuf `ItemsCombo`. Full field map is in `docs/plan.md`.
-
-What the stream provides anonymously:
-- Yes: price, change, % change, cumulative day volume, open/high/low, market cap, ms timestamp.
-- No: bid/ask, individual trades, 52-week hi/lo.
-
-The REST gainers response includes `tickerId`.
-
-The working Python probes are in the old scratchpad and may be gone. `docs/plan.md` has everything needed to reimplement them.
+Anonymously the stream gives price, change, % change, cumulative day volume, open/high/low, market cap and a ms timestamp. It gives no bid/ask, individual trades or 52-week hi/lo. The REST gainers response includes `tickerId`. It is an unofficial API; the REST fallback must keep working.
 
 ## Environment gotchas
 
 - The default rustc is 1.70. `rust-toolchain.toml` selects `stable` (1.85). Keep dependencies compatible with 1.85; `resolver = "3"` is set.
-- Long inline Python heredocs in the Bash tool can get truncated. Write scripts to a file, or use the Edit tool.
+- Many `src` files and the docs use CRLF line endings; keep them (use the Edit tool, not `sed -i`).
 - `config.json` is gitignored: it contains the Finviz proxy key. Never commit it.
 - Art in `src/art.rs` / `src/chart.rs` is ported from ASCII Magic (MIT); the notice is in `THIRD_PARTY_LICENSES.md`.
+- Nothing outside `C:\Users\ZX202\kodi\` may be changed without the user's permission (see the user's global CLAUDE.md).
 
-## Waiting on the user
+## Later ideas
 
-- After step 10 exists: run `volume_screener.exe --probe` for a full day (before 11:00 to after 23:00 Riga time) and share the CSV.
-- Decide whether the public repo should keep the Webull stream details in `docs/`, or make the repo private.
+- Rate-based SPIKE and robust PUMP (design 2.2 / 2.3) if the user wants them back.
+- Historical candle backfill from a Webull chart endpoint (unverified), so charts cover time before the app started.
