@@ -16,10 +16,10 @@ Status as of 2026-11-16. Spec: `docs/plan.md` (user decisions, authoritative) an
 - [x] 10. Probe mode (`1b27d6f`)
 - [x] 11. Vol/m column (`8b9d374`)
 - [x] 12. Ranking (`c49d618`)
+- [x] 13. SETUP (`e6dd601`)
 
 ## Unfinished: build steps in order
 
-- [ ] 13. **SETUP** (item 13): user's proven logic (vol ratio + price % vs N seconds ago), all three adjustable (defaults 300 s / 2.2x / +10%), config key migration, hide SPIKE and PUMP.
 - [ ] 14. **Cooldown + sticky badge** (items 12, 15): 2 min cooldown per symbol+kind, status label stays visible during cooldown and ≥ 60 s.
 - [ ] 15. **NEW rework** (item 14): listed now and not in last 30 min; silent seeding on startup / session change / filter change.
 - [ ] 16. **Rate panel tabs** (item 16): `t` toggles New Highs/Lows (default) and Up/Down ticks; tab remembered in config.
