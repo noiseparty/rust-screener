@@ -8,7 +8,8 @@
 use crate::app::Msg;
 use crate::scraper::USER_AGENT;
 use crate::session::Session;
-use std::collections::{BTreeSet, HashSet};
+use chrono::{DateTime, Utc};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::net::{TcpStream, ToSocketAddrs};
@@ -77,7 +78,7 @@ pub struct StreamStatus {
 #[derive(Debug, PartialEq)]
 pub enum Packet {
     ConnAck { code: u8 },
-    SubAck { id: u16 },
+    SubAck { id: u16, codes: Vec<u8> },
     Publish { topic: String, payload: Vec<u8> },
     PingResp,
     Other(u8),
@@ -182,7 +183,7 @@ fn parse_packet(first: u8, body: &[u8]) -> Result<Packet, String> {
     };
     Ok(match first >> 4 {
         2 => Packet::ConnAck { code: *body.get(1).ok_or_else(short)? },
-        9 => Packet::SubAck { id: u16_at(0)? },
+        9 => Packet::SubAck { id: u16_at(0)?, codes: body.get(2..).unwrap_or(&[]).to_vec() },
         13 => Packet::PingResp,
         3 => {
             let qos = (first >> 1) & 3;
@@ -346,6 +347,75 @@ pub fn decode_items_combo(buf: &[u8], topic_id: Option<u64>) -> Option<Update> {
     (u.id != 0).then_some(u)
 }
 
+/// Every field of one message as the server sent it, keyed by protobuf field number and rendered
+/// as text. Probe mode records these untouched, including fields the app does not use.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RawMsg {
+    pub id: u64,
+    /// BaseItem (field 1 of ItemsCombo).
+    pub base: BTreeMap<u32, String>,
+    /// SaleItem (field 2).
+    pub sale: BTreeMap<u32, String>,
+    /// StatsItem (field 3).
+    pub stats: BTreeMap<u32, String>,
+    /// Other top-level modules present: (field number, payload length).
+    pub modules: Vec<(u32, usize)>,
+}
+
+fn raw_text(v: &Val) -> String {
+    match v {
+        Val::Varint(n) => n.to_string(),
+        Val::Bytes(b) => match std::str::from_utf8(b) {
+            Ok(s) if !s.chars().any(char::is_control) => s.to_string(),
+            _ => b.iter().map(|x| format!("{x:02x}")).collect(),
+        },
+        Val::Other => "<fixed>".to_string(),
+    }
+}
+
+fn raw_fields(buf: &[u8]) -> Option<BTreeMap<u32, String>> {
+    let mut m = BTreeMap::new();
+    for f in Fields::new(buf) {
+        let (n, v) = f.ok()?;
+        m.insert(n, raw_text(&v));
+    }
+    Some(m)
+}
+
+/// Like `decode_items_combo`, but keeps all raw fields as text. `None` for malformed payloads or when no id is known.
+pub fn decode_raw(buf: &[u8], topic_id: Option<u64>) -> Option<RawMsg> {
+    let mut m = RawMsg::default();
+    for f in Fields::new(buf) {
+        let (field, val) = f.ok()?;
+        let Val::Bytes(sub) = val else { continue };
+        match field {
+            1 => m.base = raw_fields(sub)?,
+            2 => m.sale = raw_fields(sub)?,
+            3 => m.stats = raw_fields(sub)?,
+            n => m.modules.push((n, sub.len())),
+        }
+    }
+    m.id = m.base.get(&3).and_then(|v| v.parse().ok()).filter(|&v| v != 0).or(topic_id).unwrap_or(0);
+    (m.id != 0).then_some(m)
+}
+
+/// Diagnostics for probe mode, sent with the wall-clock time they happened.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Event {
+    /// WebSocket, CONNECT and the header subscription all succeeded; `n` counts connections so far.
+    Connected { n: u64 },
+    /// A SUBSCRIBE (or UNSUBSCRIBE) packet was sent for `count` tickers; `total` is the number held afterwards.
+    Subscribe { id: u16, count: usize, total: usize },
+    Unsubscribe { id: u16, count: usize, total: usize },
+    /// Return codes of a SUBACK (0 = QoS 0 granted, 0x80 = refused).
+    SubAck { id: u16, codes: Vec<u8> },
+    Disconnected { reason: String },
+    Undecodable { topic: String, len: usize },
+    Raw(RawMsg),
+}
+
+pub type Stamped = (DateTime<Utc>, Event);
+
 fn topic_ticker_id(topic: &str) -> Option<u64> {
     let v: serde_json::Value = serde_json::from_str(topic).ok()?;
     let id = v.get("tickerId")?;
@@ -435,12 +505,20 @@ impl Conn {
 struct Shared {
     tx: Sender<Msg>,
     rx: Receiver<Cmd>,
+    /// Probe mode only: receives raw messages and connection events.
+    events: Option<Sender<Stamped>>,
     wanted: BTreeSet<u64>,
     st: StreamStatus,
     did: String,
 }
 
 impl Shared {
+    fn event(&self, e: impl FnOnce() -> Event) {
+        if let Some(tx) = &self.events {
+            let _ = tx.send((Utc::now(), e()));
+        }
+    }
+
     fn emit(&self) -> bool {
         self.tx.send(Msg::Stream(self.st.clone())).is_ok()
     }
@@ -470,8 +548,13 @@ fn random_did() -> String {
 }
 
 pub fn spawn(tx: Sender<Msg>, rx: Receiver<Cmd>) {
+    spawn_with(tx, rx, None);
+}
+
+/// As `spawn`, and with `events` set the worker also reports raw messages and connection events (probe mode).
+pub fn spawn_with(tx: Sender<Msg>, rx: Receiver<Cmd>, events: Option<Sender<Stamped>>) {
     thread::spawn(move || {
-        let mut sh = Shared { tx, rx, wanted: BTreeSet::new(), st: StreamStatus::default(), did: random_did() };
+        let mut sh = Shared { tx, rx, events, wanted: BTreeSet::new(), st: StreamStatus::default(), did: random_did() };
         supervise(&mut sh);
     });
 }
@@ -501,6 +584,7 @@ fn supervise(sh: &mut Shared) {
         };
         sh.st.connected = false;
         sh.st.subs = 0;
+        sh.event(|| Event::Disconnected { reason: err.clone() });
         sh.st.error = Some(err);
         if got_data {
             backoff = Duration::from_secs(1);
@@ -546,12 +630,15 @@ fn run_connection(sh: &mut Shared, tls: &Arc<rustls::ClientConfig>, got_data: &m
     // The header topic has to be subscribed before any ticker topic.
     let id = c.id();
     c.send(encode_subscribe(id, &header_topic(&sh.did)))?;
-    c.wait_for("SUBACK", CONNECT_TIMEOUT, |p| *p == Packet::SubAck { id })?;
+    if let Packet::SubAck { codes, .. } = c.wait_for("SUBACK", CONNECT_TIMEOUT, |p| matches!(p, Packet::SubAck { id: i, .. } if *i == id))? {
+        sh.event(|| Event::SubAck { id, codes });
+    }
 
     sh.st.connected = true;
     sh.st.connections += 1;
     sh.st.error = None;
     sh.st.last_msg = None;
+    sh.event(|| Event::Connected { n: sh.st.connections });
     // Sent before any quote of this connection so the app can drop state from the previous one.
     if !sh.emit() {
         return Ok(());
@@ -575,22 +662,35 @@ fn run_connection(sh: &mut Shared, tls: &Arc<rustls::ClientConfig>, got_data: &m
             for i in chunk {
                 subscribed.remove(i);
             }
+            sh.event(|| Event::Unsubscribe { id, count: chunk.len(), total: subscribed.len() });
         }
         for chunk in add.chunks(SUB_CHUNK) {
             let id = c.id();
             c.send(encode_subscribe(id, &tickers_topic(chunk)))?;
             subscribed.extend(chunk);
+            sh.event(|| Event::Subscribe { id, count: chunk.len(), total: subscribed.len() });
         }
         sh.st.subs = subscribed.len();
 
         for p in c.poll()? {
-            if let Packet::Publish { topic, payload } = p {
-                if let Some(u) = decode_items_combo(&payload, topic_ticker_id(&topic)) {
-                    count += 1;
-                    *got_data = true;
-                    sh.st.last_msg = Some(u.recv);
-                    batch.push(u);
+            match p {
+                Packet::Publish { topic, payload } => {
+                    let tid = topic_ticker_id(&topic);
+                    if sh.events.is_some() {
+                        match decode_raw(&payload, tid) {
+                            Some(raw) => sh.event(|| Event::Raw(raw)),
+                            None => sh.event(|| Event::Undecodable { topic: topic.clone(), len: payload.len() }),
+                        }
+                    }
+                    if let Some(u) = decode_items_combo(&payload, tid) {
+                        count += 1;
+                        *got_data = true;
+                        sh.st.last_msg = Some(u.recv);
+                        batch.push(u);
+                    }
                 }
+                Packet::SubAck { id, codes } => sh.event(|| Event::SubAck { id, codes }),
+                _ => {}
             }
         }
 
@@ -660,7 +760,7 @@ mod tests {
     fn parses_connack_suback_pingresp() {
         let mut buf = vec![0x20, 2, 0, 0, 0x90, 3, 0, 7, 0, 0xD0, 0];
         let pk = parse_packets(&mut buf).unwrap();
-        assert_eq!(pk, vec![Packet::ConnAck { code: 0 }, Packet::SubAck { id: 7 }, Packet::PingResp]);
+        assert_eq!(pk, vec![Packet::ConnAck { code: 0 }, Packet::SubAck { id: 7, codes: vec![0] }, Packet::PingResp]);
         assert!(buf.is_empty());
     }
 
@@ -755,6 +855,32 @@ mod tests {
         assert_eq!(u.volume, Some(1_234_567));
         assert_eq!(u.high, Some(1.4));
         assert_eq!(u.low, Some(0.9));
+    }
+
+    #[test]
+    fn raw_decode_keeps_every_field_as_text() {
+        let m = decode_raw(&sample(), None).unwrap();
+        assert_eq!(m.id, 950978197);
+        assert_eq!(m.base.get(&1).map(String::as_str), Some("5"));
+        assert_eq!(m.base.get(&4).map(String::as_str), Some("T"));
+        assert_eq!(m.base.get(&5).map(String::as_str), Some("1763400000123"));
+        assert_eq!(m.base.get(&8).map(String::as_str), Some("9")); // unknown field kept
+        assert_eq!(m.sale.get(&7).map(String::as_str), Some("12,500,000")); // not normalised
+        assert_eq!(m.stats.get(&52).map(String::as_str), Some("3"));
+        assert_eq!(m.modules, vec![(6, 7)]);
+    }
+
+    #[test]
+    fn raw_decode_id_fallback_and_rejects() {
+        let buf = f_bytes(3, &f_str(3, "10"));
+        assert_eq!(decode_raw(&buf, Some(7)).unwrap().id, 7);
+        assert!(decode_raw(&buf, None).is_none());
+        let mut b = sample();
+        b.truncate(b.len() - 3);
+        assert!(decode_raw(&b, Some(1)).is_none());
+        // binary string field is hex-encoded
+        let buf = f_bytes(2, &f_bytes(9, &[0xFF, 0x01]));
+        assert_eq!(decode_raw(&buf, Some(1)).unwrap().sale.get(&9).map(String::as_str), Some("ff01"));
     }
 
     #[test]

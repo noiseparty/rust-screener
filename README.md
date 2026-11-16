@@ -26,6 +26,31 @@ moved there once. No installer is needed.
 
 `rust-toolchain.toml` pins the `stable` toolchain (needs 1.85+).
 
+## Probe mode
+
+```
+volume_screener.exe --probe
+```
+
+Headless recorder (no TUI) for checking how the stream behaves across session changes: extended-hours price fields,
+volume/high/low resets, status codes, `tradeStamp`, and the subscription cap. It refreshes the gainers list over REST
+every 20 s (asking for 200 rows, so more than 100 are subscribed), subscribes to all of them and appends every raw
+message and connection event to `probe\probe-YYYY-MM-DD.csv` in the app home (date = local start date; a restart on the
+same day continues the same file). It reconnects like the app and idles while the market is closed. A status line is
+printed every 30 s; `Ctrl+C` stops it and flushes the file (the file is also flushed every second).
+
+Leave it running from before 11:00 Riga (pre-market) through 23:00 and, to see the after-hours session, past it. Then
+share the CSV. `--probe-dir <folder>` writes somewhere other than `%LOCALAPPDATA%\VolumeScreener\probe\`.
+
+CSV columns: `recv_utc, recv_ny, recv_session` (receive time and the session it falls in), `kind` (`msg` or an event:
+`start`, `list`, `list_error`, `connect`, `subscribe`, `unsubscribe`, `suback`, `disconnect`, `undecodable`, `stop`),
+`ticker_id, symbol, list_pos` (rank in the latest REST list), then the raw fields as sent: `trans_id, trd_seq, status,
+trade_stamp_ms, trade_utc, trade_session` (session of the message's own timestamp), `close, change, change_ratio,
+p_price, p_change, p_ch_ratio, market_value, hlt_rsn, sale_inited`, `trade_time, last_price_vol, volume, deal_amount,
+open, high, low, wk52_high, wk52_low, stats_inited`, `topic, pub_id, base_inited`, `modules` (other message parts as
+`field:length`), `extra` (undocumented fields as `b`/`s`/`t` + number = value), `detail` (event text, e.g. SUBACK return
+codes).
+
 ## Layout
 
 ```
