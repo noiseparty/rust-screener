@@ -325,13 +325,22 @@ impl Engine {
             self.ticks.pop_front();
         }
 
+        // rank_change is derived from rank order, so Mov cannot be ranked by itself:
+        // rank by change, then reorder by the computed movement.
+        let (rank_key, rank_desc) = if sort_key == "mov" { ("change", true) } else { (sort_key, sort_desc) };
         active.sort_by(|a, b| {
-            let o = compare(a, b, sort_key);
-            if sort_desc { o.reverse() } else { o }
+            let o = compare(a, b, rank_key);
+            if rank_desc { o.reverse() } else { o }
         });
         active.truncate(MAX_ROWS);
 
-        self.track_ranks(&mut active, sort_key, sort_desc, now);
+        self.track_ranks(&mut active, rank_key, rank_desc, now);
+        if sort_key == "mov" {
+            active.sort_by(|a, b| {
+                let o = compare(a, b, sort_key);
+                if sort_desc { o.reverse() } else { o }
+            });
+        }
 
         while self.alerts.len() > th.max_alerts {
             self.alerts.pop_front();
@@ -378,7 +387,7 @@ fn prune<T>(hist: &mut Vec<(Instant, T)>, now: Instant, window: Duration) {
 
 pub fn compare(a: &Ticker, b: &Ticker, key: &str) -> Ordering {
     let f = |x: f64, y: f64| x.partial_cmp(&y).unwrap_or(Ordering::Equal);
-    match key {
+    let primary = match key {
         "mov" => a.rank_change.cmp(&b.rank_change),
         "symbol" => a.symbol.cmp(&b.symbol),
         "price" => f(a.price, b.price),
@@ -388,7 +397,8 @@ pub fn compare(a: &Ticker, b: &Ticker, key: &str) -> Ordering {
         "delta" => a.vol_delta.cmp(&b.vol_delta),
         "status" => a.status.cmp(&b.status),
         _ => f(a.change_ratio, b.change_ratio).then(a.vol_delta.cmp(&b.vol_delta)),
-    }
+    };
+    primary.then_with(|| a.symbol.cmp(&b.symbol))
 }
 
 #[cfg(test)]
@@ -512,6 +522,15 @@ mod tests {
         assert_eq!(e.vol_hist["F"].len(), 1);
         assert_eq!(e.price_hist["F"].len(), 1);
         assert!(e.candles("F").is_some());
+    }
+
+    #[test]
+    fn compare_ties_break_by_symbol() {
+        let a = tk("AAA", 1.0, 10, 0.0, 1.0);
+        let b = tk("BBB", 1.0, 10, 0.0, 1.0);
+        for key in ["mov", "price", "change", "volume", "status"] {
+            assert_eq!(compare(&a, &b, key), Ordering::Less);
+        }
     }
 
     #[test]
