@@ -7,6 +7,7 @@ mod health;
 mod paths;
 mod scraper;
 mod session;
+mod stream;
 mod ui;
 
 use app::{App, Msg};
@@ -52,6 +53,12 @@ fn main() {
         }
     });
 
+    let stream_tx = cfg.stream_enabled.then(|| {
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        stream::spawn(msg_tx.clone(), cmd_rx);
+        cmd_tx
+    });
+
     let (health_tx, health_rx) = mpsc::channel::<()>();
     let proxy = cfg.finviz_proxy_url.clone();
     thread::spawn(move || {
@@ -62,7 +69,7 @@ fn main() {
         }
     });
 
-    let mut app = App::new(cfg, paths.config.clone(), fetch_tx, health_tx);
+    let mut app = App::new(cfg, paths.config.clone(), fetch_tx, health_tx, stream_tx);
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, &mut app, &msg_rx);
     ratatui::restore();

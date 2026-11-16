@@ -7,11 +7,15 @@ const API: &str = "https://quotes-gw.webullfintech.com/api/bgw/market/pcIndex?re
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Ticker {
+    /// Webull tickerId (0 when the row had none); the key of the push stream.
+    pub ticker_id: u64,
     pub symbol: String,
     pub price: f64,
     pub volume: i64,
     pub change_ratio: f64,
     pub market_value: f64,
+    /// Previous close, derived from price and change ratio; basis for locally computed change %.
+    pub prev_close: f64,
     pub vol_delta: i64,
     pub rank_change: i32,
     pub status: String,
@@ -83,6 +87,8 @@ pub fn parse(body: &Value, session: Session) -> Result<Fetched, String> {
                 change = num(Some(data), "changeRatio");
             }
             Ticker {
+                ticker_id: num(Some(data), "tickerId") as u64,
+                prev_close: if price > 0.0 && change > -1.0 { price / (1.0 + change) } else { 0.0 },
                 symbol: data.get("symbol").and_then(Value::as_str).unwrap_or("").trim().to_string(),
                 price,
                 volume: num(Some(data), "volume") as i64,

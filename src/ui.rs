@@ -280,10 +280,16 @@ fn header_bar(f: &mut Frame, app: &App, area: Rect) {
     left.push(Span::styled("   alerts ", Style::new().fg(FAINT)));
     left.push(Span::styled(app.filter_name(), Style::new().fg(TEXT).bold()));
 
+    let amber = Color::Rgb(245, 158, 11);
+    let st = app.stream_status();
+    let wss = format!("WSS {} subs {:.0} msg/s", st.subs, st.msgs_per_sec);
     let (dot, color, status) = match (&app.error, &app.last_update) {
+        (Some(e), _) if app.stream_ok() => ("●", amber, format!("{wss}, list: {e}")),
         (Some(e), _) => ("●", RED, format!("error: {e}")),
+        (None, Some(_)) if app.stream_ok() => ("●", GREEN, wss),
+        (None, Some(_)) if app.stream_enabled() => ("●", amber, "REST, stream down".to_string()),
         (None, Some(t)) => ("●", GREEN, format!("live  {t}")),
-        (None, None) => ("●", Color::Rgb(245, 158, 11), "connecting".to_string()),
+        (None, None) => ("●", amber, "connecting".to_string()),
     };
     let right = Line::from(vec![
         Span::styled(format!("{dot} "), Style::new().fg(color)),
@@ -521,7 +527,7 @@ fn footer_bar(f: &mut Frame, app: &App, area: Rect) {
     for (k, l) in [("enter", "chart"), ("←→", "column"), ("s", "sort"), ("f", "alerts"), ("v", "columns"), ("r", "refresh"), ("o", "setup"), ("q", "quit")] {
         spans.extend(keyhint(k, l));
     }
-    let interval = app.cfg.refresh_interval_seconds.max(1);
+    let interval = app.poll_interval();
     let left = app.countdown().min(interval);
     let gw = 16usize;
     let filled = (((interval - left) as f64 / interval as f64) * gw as f64).round() as usize;

@@ -73,3 +73,4 @@ Config screen: Tab/↑/↓ to move, type to edit, Enter or Ctrl+S to save, Esc t
 - Fetching keeps running while in setup screens; previews use a snapshot taken on entry.
 - Finviz columns dropped (they were never populated); `finviz_*` config keys are kept and the proxy is still in Health Check.
 - `column_order` and `finviz_*_seconds` config keys removed (unused).
+- Live quotes come from Webull's push stream (MQTT over WSS, `src/stream.rs`); the REST list is refreshed every 20 s and `refresh_interval_seconds` is the poll used only while the stream is down. Set `"stream_enabled": false` in `config.json` to use REST polling only. The header shows `● WSS n subs m msg/s` or `● REST, stream down`.

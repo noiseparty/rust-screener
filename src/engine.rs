@@ -1,11 +1,17 @@
 use crate::config::Config;
 use crate::scraper::Ticker;
+use crate::session::Session;
+use crate::stream::Update;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 pub const MAX_ROWS: usize = 100;
 pub const MAX_CANDLES: usize = 390;
+/// A stream quote older than this no longer overrides the REST row.
+pub const LIVE_FRESH: Duration = Duration::from_secs(15);
+/// Consecutive lower cumulative-volume readings after which the lower value is believed.
+const LOWER_VOL_ACCEPT: u8 = 3;
 pub const RATE_WINDOWS: [(&str, u64); 4] = [("20m", 1200), ("5m", 300), ("1m", 60), ("30s", 30)];
 
 /// One-minute OHLCV bar built from observed price/volume samples.
@@ -153,6 +159,17 @@ pub struct Output {
     pub new_alerts: usize,
 }
 
+/// Latest accepted stream quote of one ticker.
+#[derive(Debug, Clone, Copy)]
+struct Live {
+    last_ms: i64,
+    last_seq: u64,
+    price: f64,
+    volume: i64,
+    lower: u8,
+    at: Instant,
+}
+
 pub struct Engine {
     pub filters: Filters,
     pub th: Thresholds,
@@ -168,6 +185,9 @@ pub struct Engine {
     ticks: VecDeque<(Instant, bool)>,
     candles: HashMap<String, VecDeque<Candle>>,
     last_cum_vol: HashMap<String, i64>,
+    live: HashMap<u64, Live>,
+    /// tickerId -> position in `latest`.
+    index: HashMap<u64, usize>,
 }
 
 impl Engine {
@@ -185,6 +205,69 @@ impl Engine {
             ticks: VecDeque::new(),
             candles: HashMap::new(),
             last_cum_vol: HashMap::new(),
+            live: HashMap::new(),
+            index: HashMap::new(),
+        }
+    }
+
+    /// Folds a batch of stream quotes into the last processed rows (price, volume, change %, market cap).
+    /// Records no alerts or history. Returns true when any row changed.
+    pub fn apply_quotes(&mut self, updates: &[Update], session: Session, now: Instant) -> bool {
+        let mut changed = false;
+        for u in updates {
+            // Extended-hours price is taken from pPrice when present (unverified against the
+            // live stream); regular hours use close.
+            let ext = matches!(session, Session::Pre | Session::After);
+            let px = if ext { u.p_price.filter(|p| *p > 0.0).or(u.close) } else { u.close };
+            // A message without price or volume is dropped, never read as zero.
+            let (Some(px), Some(vol)) = (px.filter(|p| *p > 0.0), u.volume) else { continue };
+            let vol = vol as i64;
+            let prev = self.live.get(&u.id).copied();
+            if let Some(p) = prev {
+                if u.trade_ms < p.last_ms || (u.trade_ms == p.last_ms && u.seq <= p.last_seq) {
+                    continue;
+                }
+            }
+            let mut lower = 0;
+            if let Some(p) = prev.filter(|p| vol < p.volume) {
+                lower = p.lower + 1;
+                if lower < LOWER_VOL_ACCEPT {
+                    self.live.insert(u.id, Live { lower, ..p });
+                    continue;
+                }
+                lower = 0;
+            }
+            self.live.insert(
+                u.id,
+                Live { last_ms: u.trade_ms, last_seq: u.seq, price: px, volume: vol, lower, at: now },
+            );
+            let Some(&i) = self.index.get(&u.id) else { continue };
+            let t = &mut self.latest[i];
+            if vol > t.volume {
+                t.vol_delta += vol - t.volume;
+            }
+            t.price = px;
+            t.volume = vol;
+            t.change_ratio = change_from(t.prev_close, px).or(u.change_ratio).unwrap_or(t.change_ratio);
+            if let Some(m) = u.mcap.filter(|m| *m > 0.0) {
+                t.market_value = m;
+            }
+            let sym = t.symbol.clone();
+            self.record_sample(&sym, chrono::Local::now().timestamp(), px, vol);
+            changed = true;
+        }
+        changed
+    }
+
+    /// Replaces a REST row's price/volume/change by the freshest stream quote, if there is one.
+    fn overlay_live(&self, t: &mut Ticker, now: Instant) {
+        let Some(l) = self.live.get(&t.ticker_id).filter(|l| now.saturating_duration_since(l.at) <= LIVE_FRESH) else {
+            return;
+        };
+        t.price = l.price;
+        t.volume = l.volume;
+        if let Some(c) = change_from(t.prev_close, l.price) {
+            t.change_ratio = c;
         }
     }
 
@@ -261,6 +344,7 @@ impl Engine {
         let mut latest = Vec::with_capacity(tickers.len());
 
         for mut t in tickers {
+            self.overlay_live(&mut t, now);
             let is_bl = self.blacklist.contains(&t.symbol);
             let shown = is_bl || self.filters.matches(&t);
 
@@ -357,6 +441,8 @@ impl Engine {
                 t.rank_change = r;
             }
         }
+        self.index = latest.iter().enumerate().filter(|(_, t)| t.ticker_id != 0).map(|(i, t)| (t.ticker_id, i)).collect();
+        self.live.retain(|id, _| self.index.contains_key(id));
         self.latest = latest;
 
         Output { active, blacklisted, new_alerts }
@@ -408,6 +494,11 @@ impl Engine {
         }
         ctx.retain(|_, h| h.last().is_some_and(|&(at, _)| now.saturating_duration_since(at) < Duration::from_secs(300)));
     }
+}
+
+/// Change ratio versus the previous close, when that is known.
+fn change_from(prev_close: f64, price: f64) -> Option<f64> {
+    (prev_close > 0.0).then(|| price / prev_close - 1.0)
 }
 
 /// Oldest sample inside the window, falling back to the oldest sample overall.
@@ -625,5 +716,86 @@ mod tests {
         let ts: Vec<_> = (0..25).map(|i| tk(&format!("T{i}"), 1.0, 1, 0.1, 0.0)).collect();
         e.process(ts, "change", true, Instant::now());
         assert_eq!(e.alerts().len(), 10);
+    }
+
+    fn upd(id: u64, ms: i64, seq: u64, px: f64, vol: u64) -> Update {
+        Update {
+            id,
+            trade_ms: ms,
+            seq,
+            close: Some(px),
+            p_price: None,
+            change_ratio: None,
+            volume: Some(vol),
+            mcap: None,
+            high: None,
+            low: None,
+            status: String::new(),
+            recv: Instant::now(),
+        }
+    }
+
+    fn live_engine() -> (Engine, Instant) {
+        let mut e = engine();
+        let t0 = Instant::now();
+        let a = Ticker { ticker_id: 7, prev_close: 1.0, ..tk("A", 1.1, 1000, 0.1, 5e6) };
+        e.process(vec![a], "change", true, t0);
+        (e, t0)
+    }
+
+    #[test]
+    fn quotes_update_rows_and_change_is_local() {
+        let (mut e, t0) = live_engine();
+        assert!(e.apply_quotes(&[upd(7, 1000, 1, 1.5, 1600)], Session::Reg, t0));
+        let t = &e.reapply("change", true).active[0];
+        assert_eq!((t.price, t.volume), (1.5, 1600));
+        assert!((t.change_ratio - 0.5).abs() < 1e-9);
+        assert_eq!(t.vol_delta, 600);
+        // unknown ids and ids without volume change nothing
+        assert!(!e.apply_quotes(&[upd(99, 1, 1, 1.0, 1)], Session::Reg, t0));
+        let mut nov = upd(7, 2000, 1, 2.0, 0);
+        nov.volume = None;
+        assert!(!e.apply_quotes(&[nov], Session::Reg, t0));
+    }
+
+    #[test]
+    fn quotes_ordering_and_lower_volume() {
+        let (mut e, t0) = live_engine();
+        e.apply_quotes(&[upd(7, 1000, 5, 1.5, 2000)], Session::Reg, t0);
+        // older timestamp, same ms with lower/equal seq: dropped
+        assert!(!e.apply_quotes(&[upd(7, 999, 9, 1.9, 2100)], Session::Reg, t0));
+        assert!(!e.apply_quotes(&[upd(7, 1000, 5, 1.9, 2100)], Session::Reg, t0));
+        assert!(e.apply_quotes(&[upd(7, 1000, 6, 1.6, 2100)], Session::Reg, t0));
+        // lower volume: dropped twice, believed on the third reading
+        assert!(!e.apply_quotes(&[upd(7, 1100, 1, 1.6, 50)], Session::Reg, t0));
+        assert!(!e.apply_quotes(&[upd(7, 1200, 1, 1.6, 50)], Session::Reg, t0));
+        assert_eq!(e.reapply("change", true).active[0].volume, 2100);
+        assert!(e.apply_quotes(&[upd(7, 1300, 1, 1.6, 50)], Session::Reg, t0));
+        assert_eq!(e.reapply("change", true).active[0].volume, 50);
+    }
+
+    #[test]
+    fn extended_hours_prefers_p_price() {
+        let (mut e, t0) = live_engine();
+        let mut u = upd(7, 1000, 1, 1.5, 1100);
+        u.p_price = Some(1.8);
+        e.apply_quotes(&[u.clone()], Session::Pre, t0);
+        assert_eq!(e.reapply("change", true).active[0].price, 1.8);
+        u.trade_ms = 2000;
+        e.apply_quotes(&[u], Session::Reg, t0);
+        assert_eq!(e.reapply("change", true).active[0].price, 1.5);
+    }
+
+    #[test]
+    fn rest_refresh_keeps_fresh_stream_values() {
+        let (mut e, t0) = live_engine();
+        e.apply_quotes(&[upd(7, 1000, 1, 1.5, 1600)], Session::Reg, t0);
+        let rest = Ticker { ticker_id: 7, prev_close: 1.0, ..tk("A", 1.2, 1200, 0.2, 5e6) };
+        let out = e.process(vec![rest.clone()], "change", true, t0 + Duration::from_secs(5));
+        assert_eq!((out.active[0].price, out.active[0].volume), (1.5, 1600));
+        assert!((out.active[0].change_ratio - 0.5).abs() < 1e-9);
+        // once the stream goes quiet the REST row wins again
+        let out = e.process(vec![rest], "change", true, t0 + LIVE_FRESH + Duration::from_secs(5));
+        assert_eq!((out.active[0].price, out.active[0].volume), (1.2, 1200));
     }
 }

@@ -10,6 +10,8 @@ pub const FILTER_NAMES: [&str; 5] = ["ALL", "NEW", "PUMP", "SPIKE", "SETUP"];
 #[serde(default)]
 pub struct Config {
     pub refresh_interval_seconds: u64,
+    /// Use the Webull push stream (falls back to REST polling when it is down).
+    pub stream_enabled: bool,
     pub alert_history_max: usize,
     pub min_market_cap: f64,
     pub max_market_cap: f64,
@@ -44,6 +46,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             refresh_interval_seconds: 5,
+            stream_enabled: true,
             alert_history_max: 50,
             min_market_cap: 0.0,
             max_market_cap: 1e15,

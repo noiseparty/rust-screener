@@ -3,6 +3,7 @@ use crate::engine::{AlertKind, Engine, Filters};
 use crate::health::CheckResult;
 use crate::scraper::{Fetched, Ticker};
 use crate::session::Session;
+use crate::stream::{self, StreamStatus};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
@@ -79,8 +80,15 @@ pub enum View {
     Chart,
 }
 
+/// While the stream is healthy the REST list is only refreshed this often (membership, market cap, prev close).
+pub const LIST_REFRESH: u64 = 20;
+/// No stream message or status for this long means the stream is down.
+const STREAM_STALE: Duration = Duration::from_secs(15);
+
 pub enum Msg {
     Fetched(Result<Fetched, String>),
+    Quotes(Vec<stream::Update>),
+    Stream(StreamStatus),
     Health(Vec<CheckResult>),
 }
 
@@ -94,6 +102,10 @@ pub struct App {
 
     fetch_tx: Sender<()>,
     health_tx: Sender<()>,
+    stream_tx: Option<Sender<stream::Cmd>>,
+    stream: StreamStatus,
+    stream_status_at: Option<Instant>,
+    last_fetch: Option<Instant>,
     fetching: bool,
     running: bool,
     pub next_refresh: Instant,
@@ -133,7 +145,13 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cfg: Config, config_path: PathBuf, fetch_tx: Sender<()>, health_tx: Sender<()>) -> App {
+    pub fn new(
+        cfg: Config,
+        config_path: PathBuf,
+        fetch_tx: Sender<()>,
+        health_tx: Sender<()>,
+        stream_tx: Option<Sender<stream::Cmd>>,
+    ) -> App {
         let now = Instant::now();
         App {
             engine: Engine::new(&cfg),
@@ -145,6 +163,10 @@ impl App {
             started_at: now,
             fetch_tx,
             health_tx,
+            stream_tx,
+            stream: StreamStatus::default(),
+            stream_status_at: None,
+            last_fetch: None,
             fetching: false,
             running: false,
             next_refresh: now,
@@ -187,7 +209,33 @@ impl App {
         self.fetching
     }
 
+    pub fn stream_enabled(&self) -> bool {
+        self.stream_tx.is_some()
+    }
+
+    /// True while the stream is connected and delivering (or just connected and not yet silent too long).
+    pub fn stream_ok(&self) -> bool {
+        let now = Instant::now();
+        let fresh = |t: Instant| now.saturating_duration_since(t) <= STREAM_STALE;
+        self.stream_enabled()
+            && self.stream.connected
+            && self.stream_status_at.is_some_and(fresh)
+            && self.stream.last_msg.is_none_or(fresh)
+    }
+
+    pub fn stream_status(&self) -> &StreamStatus {
+        &self.stream
+    }
+
+    /// Seconds between REST list fetches: slow while the stream is healthy, the fallback poll otherwise.
+    pub fn poll_interval(&self) -> u64 {
+        if self.stream_ok() { LIST_REFRESH } else { self.cfg.refresh_interval_seconds.max(1) }
+    }
+
     pub fn on_tick(&mut self, now: Instant) {
+        if let Some(last) = self.last_fetch {
+            self.next_refresh = last + Duration::from_secs(self.poll_interval());
+        }
         if self.running && !self.fetching && now >= self.next_refresh {
             self.request_fetch();
         }
@@ -203,11 +251,15 @@ impl App {
         match msg {
             Msg::Fetched(res) => {
                 self.fetching = false;
-                self.next_refresh = Instant::now() + Duration::from_secs(self.cfg.refresh_interval_seconds);
+                self.last_fetch = Some(Instant::now());
                 match res {
                     Err(e) => self.error = Some(e),
                     Ok(f) => {
                         self.error = None;
+                        if let Some(tx) = &self.stream_tx {
+                            let ids = f.tickers.iter().map(|t| t.ticker_id).filter(|&i| i != 0).collect();
+                            let _ = tx.send(stream::Cmd::SetTickers(ids));
+                        }
                         self.all = f.tickers.clone();
                         self.group = f.group;
                         self.session = f.session;
@@ -222,6 +274,16 @@ impl App {
                         self.last_update = Some(chrono::Local::now().format("%H:%M:%S").to_string());
                     }
                 }
+            }
+            Msg::Quotes(updates) => {
+                if self.engine.apply_quotes(&updates, Session::now(), Instant::now()) {
+                    self.reapply_local();
+                    self.last_update = Some(chrono::Local::now().format("%H:%M:%S").to_string());
+                }
+            }
+            Msg::Stream(st) => {
+                self.stream = st;
+                self.stream_status_at = Some(Instant::now());
             }
             Msg::Health(results) => {
                 self.health_running = false;
@@ -660,7 +722,7 @@ mod tests {
     fn cursor_follows_selected_symbol_across_resort() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let (htx, _hrx) = std::sync::mpsc::channel();
-        let mut app = App::new(Config::default(), PathBuf::from("unused-test-config.json"), tx, htx);
+        let mut app = App::new(Config::default(), PathBuf::from("unused-test-config.json"), tx, htx, None);
         let mk = |s: &str| Ticker { symbol: s.into(), ..Default::default() };
         app.tickers = vec![mk("A"), mk("B"), mk("C")];
         app.move_row(1);
