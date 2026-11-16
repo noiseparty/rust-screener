@@ -1,4 +1,4 @@
-use crate::app::{App, View, BL_COLS, BOOT_ITEMS, COLUMNS, FIELDS, SETUP_ITEMS};
+use crate::app::{App, FieldId, FieldKind, View, BL_COLS, BOOT_ITEMS, COLUMNS, FIELDS, SETUP_ITEMS};
 use crate::config::{RateTab, FILTER_NAMES};
 use crate::engine::{AlertKind, RATE_WINDOWS};
 use crate::scraper::{Mov, Ticker};
@@ -620,14 +620,16 @@ fn setup_config(f: &mut Frame, app: &App) {
 
     let mut lines = vec![Line::raw("")];
     for (i, fld) in FIELDS.iter().enumerate() {
-        if i == 10 {
+        if fld.id == FieldId::MinChange {
             lines.push(Line::styled("  ─ display filters ─", Style::new().fg(FAINT)));
         }
         let focused = i == app.focus;
         let label_st = if focused { Style::new().fg(CYAN).bold() } else { Style::new().fg(DIM) };
         let mark = if focused { "▶" } else { " " };
         let mut val = app.inputs[i].clone();
-        if focused {
+        if matches!(fld.kind, FieldKind::Choice(_)) {
+            val = format!("◂ {val} ▸");
+        } else if focused {
             val.push('▏');
         }
         let val_st = if focused { Style::new().fg(TEXT).bg(Color::Rgb(24, 36, 30)) } else { Style::new().fg(TEXT) };

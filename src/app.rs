@@ -32,32 +32,67 @@ pub enum FieldKind {
     Smart,
     Float,
     Int,
+    /// One of a fixed list of values, picked with left/right/space instead of typed.
+    Choice(&'static [u64]),
+}
+
+/// Name of a Settings field. Everything that needs a field looks it up by name, never by position.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FieldId {
+    MinMcap,
+    MaxMcap,
+    FallbackPoll,
+    RankTrack,
+    RecomputeMs,
+    VolMWindow,
+    SetupWindow,
+    SetupVolRatio,
+    SetupPricePct,
+    MinVolAlert,
+    MinPriceAlert,
+    AlertCooldown,
+    MinChange,
+    MaxChange,
+    MinVolume,
+    MaxVolume,
+    MinPrice,
+    MaxPrice,
 }
 
 pub struct Field {
+    pub id: FieldId,
     pub label: &'static str,
     pub desc: &'static str,
     pub kind: FieldKind,
 }
 
-pub const FIELDS: [Field; 16] = [
-    Field { label: "Min Market Cap", desc: "Minimum market cap to display. K/M/B suffixes allowed (500K, 1M). 0 disables.", kind: FieldKind::Smart },
-    Field { label: "Max Market Cap", desc: "Maximum market cap to display. K/M/B suffixes allowed (1B). 0 disables.", kind: FieldKind::Smart },
-    Field { label: "SETUP Volume Ratio", desc: "SETUP needs volume at least this multiple of the volume one SETUP window ago. 2.2 = 2.2x.", kind: FieldKind::Float },
-    Field { label: "SETUP Price %", desc: "SETUP also needs price up at least this percent over the SETUP window. 10 = +10%.", kind: FieldKind::Float },
-    Field { label: "Refresh Rate (s)", desc: "How often to poll Webull, in seconds.", kind: FieldKind::Int },
-    Field { label: "Rank Track (s)", desc: "Window for rank movement (Mov column). 60 = compare to rank 60s ago.", kind: FieldKind::Int },
-    Field { label: "SETUP Window (s)", desc: "How far back SETUP compares volume and price. 300 = versus 5 minutes ago.", kind: FieldKind::Int },
-    Field { label: "Min Vol Alert", desc: "Minimum volume required before SETUP can fire.", kind: FieldKind::Int },
-    Field { label: "Min Price Alert ($)", desc: "Minimum price required before SETUP can fire.", kind: FieldKind::Float },
-    Field { label: "Vol/m Window (s)", desc: "Window for the Vol/m column (min 30). 180 = average shares per minute over the last 3 minutes.", kind: FieldKind::Int },
-    Field { label: "Min % Change", desc: "Only show tickers up at least this %. 0 disables.", kind: FieldKind::Float },
-    Field { label: "Max % Change", desc: "Only show tickers up at most this %. 0 disables.", kind: FieldKind::Float },
-    Field { label: "Min Volume", desc: "Only show tickers with at least this volume. 0 disables.", kind: FieldKind::Int },
-    Field { label: "Max Volume", desc: "Only show tickers with at most this volume. 0 disables.", kind: FieldKind::Int },
-    Field { label: "Min Price", desc: "Only show tickers priced at least this. 0 disables.", kind: FieldKind::Float },
-    Field { label: "Max Price", desc: "Only show tickers priced at most this. 0 disables.", kind: FieldKind::Float },
+pub const RECOMPUTE_CHOICES: &[u64] = &[500, 1000];
+
+pub const FIELDS: [Field; 18] = [
+    Field { id: FieldId::MinMcap, label: "Min Market Cap", desc: "Minimum market cap to display. K/M/B suffixes allowed (500K, 1M). 0 disables.", kind: FieldKind::Smart },
+    Field { id: FieldId::MaxMcap, label: "Max Market Cap", desc: "Maximum market cap to display. K/M/B suffixes allowed (1B). 0 disables.", kind: FieldKind::Smart },
+    Field { id: FieldId::FallbackPoll, label: "Fallback Poll (s)", desc: "How often to poll Webull over REST, in seconds. Used only while the live stream is down.", kind: FieldKind::Int },
+    Field { id: FieldId::RankTrack, label: "Rank Track (s)", desc: "Window for rank movement (Mov column). 60 = compare to rank 60s ago. Min 5.", kind: FieldKind::Int },
+    Field { id: FieldId::RecomputeMs, label: "Recompute (ms)", desc: "How often the table re-ranks and re-sorts. Left/right/space to switch between 500 and 1000.", kind: FieldKind::Choice(RECOMPUTE_CHOICES) },
+    Field { id: FieldId::VolMWindow, label: "Vol/m Window (s)", desc: "Window for the Vol/m column (min 30). 180 = average shares per minute over the last 3 minutes.", kind: FieldKind::Int },
+    Field { id: FieldId::SetupWindow, label: "SETUP Window (s)", desc: "How far back SETUP compares volume and price. 300 = versus 5 minutes ago.", kind: FieldKind::Int },
+    Field { id: FieldId::SetupVolRatio, label: "SETUP Volume Ratio", desc: "SETUP needs volume at least this multiple of the volume one SETUP window ago. 2.2 = 2.2x.", kind: FieldKind::Float },
+    Field { id: FieldId::SetupPricePct, label: "SETUP Price %", desc: "SETUP also needs price up at least this percent over the SETUP window. 10 = +10%.", kind: FieldKind::Float },
+    Field { id: FieldId::MinVolAlert, label: "Min Vol Alert", desc: "Minimum volume required before SETUP can fire.", kind: FieldKind::Int },
+    Field { id: FieldId::MinPriceAlert, label: "Min Price Alert ($)", desc: "Minimum price required before SETUP can fire.", kind: FieldKind::Float },
+    Field { id: FieldId::AlertCooldown, label: "Alert Cooldown (s)", desc: "Seconds before the same alert kind can fire again for one symbol. 120 = 2 minutes.", kind: FieldKind::Int },
+    Field { id: FieldId::MinChange, label: "Min % Change", desc: "Only show tickers up at least this %. 0 disables.", kind: FieldKind::Float },
+    Field { id: FieldId::MaxChange, label: "Max % Change", desc: "Only show tickers up at most this %. 0 disables.", kind: FieldKind::Float },
+    Field { id: FieldId::MinVolume, label: "Min Volume", desc: "Only show tickers with at least this volume. 0 disables.", kind: FieldKind::Int },
+    Field { id: FieldId::MaxVolume, label: "Max Volume", desc: "Only show tickers with at most this volume. 0 disables.", kind: FieldKind::Int },
+    Field { id: FieldId::MinPrice, label: "Min Price", desc: "Only show tickers priced at least this. 0 disables.", kind: FieldKind::Float },
+    Field { id: FieldId::MaxPrice, label: "Max Price", desc: "Only show tickers priced at most this. 0 disables.", kind: FieldKind::Float },
 ];
+
+/// Position of a field in `FIELDS` (and in the input list).
+pub fn field_index(id: FieldId) -> usize {
+    FIELDS.iter().position(|f| f.id == id).expect("every FieldId is listed in FIELDS")
+}
 
 pub const BOOT_ITEMS: [&str; 3] = ["Start Volume Screener", "Health Check", "Settings"];
 pub const SETUP_ITEMS: [(&str, &str); 3] = [
@@ -357,17 +392,7 @@ impl App {
 
     /// Filters built from the unsaved config inputs, for the live preview.
     pub fn preview_filters(&self) -> Filters {
-        let v = |i: usize| parse_field(&self.inputs[i], FIELDS[i].kind).unwrap_or(0.0);
-        Filters {
-            min_mcap: v(0),
-            max_mcap: v(1),
-            min_change_pct: v(10),
-            max_change_pct: v(11),
-            min_volume: v(12) as i64,
-            max_volume: v(13) as i64,
-            min_price: v(14),
-            max_price: v(15),
-        }
+        filters_from_inputs(&self.inputs)
     }
 
     pub fn on_key(&mut self, k: KeyEvent) {
@@ -569,6 +594,14 @@ impl App {
             KeyCode::BackTab | KeyCode::Up => self.focus = (self.focus + n - 1) % n,
             KeyCode::Char('s') if k.modifiers.contains(KeyModifiers::CONTROL) => self.commit_config(),
             KeyCode::Enter => self.commit_config(),
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if matches!(FIELDS[self.focus].kind, FieldKind::Choice(_)) => {
+                if let FieldKind::Choice(opts) = FIELDS[self.focus].kind {
+                    let back = k.code == KeyCode::Left;
+                    self.inputs[self.focus] = cycle_choice(&self.inputs[self.focus], opts, back);
+                }
+            }
+            // A choice field takes no typing.
+            KeyCode::Backspace | KeyCode::Char(_) if matches!(FIELDS[self.focus].kind, FieldKind::Choice(_)) => {}
             KeyCode::Backspace => {
                 self.inputs[self.focus].pop();
             }
@@ -580,35 +613,14 @@ impl App {
     }
 
     fn commit_config(&mut self) {
-        let mut vals = [0f64; 16];
-        for (i, f) in FIELDS.iter().enumerate() {
-            match parse_field(&self.inputs[i], f.kind) {
-                Some(v) => vals[i] = v,
-                None => {
-                    self.focus = i;
-                    self.config_err = Some(format!("Invalid {}", f.label));
-                    return;
-                }
+        match config_from_inputs(&self.cfg, &self.inputs) {
+            Ok(cfg) => self.cfg = cfg,
+            Err(i) => {
+                self.focus = i;
+                self.config_err = Some(format!("Invalid {}", FIELDS[i].label));
+                return;
             }
         }
-        let c = &mut self.cfg;
-        c.min_market_cap = vals[0];
-        c.max_market_cap = vals[1];
-        c.setup_vol_ratio = vals[2];
-        c.setup_price_pct = vals[3];
-        c.refresh_interval_seconds = vals[4] as u64;
-        c.rank_tracking_interval_seconds = vals[5] as u64;
-        c.setup_window_sec = vals[6] as u64;
-        c.min_volume_for_alert = vals[7] as i64;
-        c.min_price_for_alert = vals[8];
-        c.vol_m_window_seconds = vals[9] as u64;
-        c.min_change_percent = vals[10];
-        c.max_change_percent = vals[11];
-        c.min_volume = vals[12] as i64;
-        c.max_volume = vals[13] as i64;
-        c.min_price = vals[14];
-        c.max_price = vals[15];
-        c.validate();
         self.engine.apply_config(&self.cfg);
         self.inputs = inputs_from(&self.cfg);
         self.config_err = None;
@@ -711,25 +723,97 @@ impl App {
     }
 }
 
+/// Text shown in the input box for one field.
+fn input_text(c: &Config, id: FieldId) -> String {
+    match id {
+        FieldId::MinMcap => format!("{:.0}", c.min_market_cap),
+        FieldId::MaxMcap => format!("{:.0}", c.max_market_cap),
+        FieldId::FallbackPoll => c.refresh_interval_seconds.to_string(),
+        FieldId::RankTrack => c.rank_tracking_interval_seconds.to_string(),
+        FieldId::RecomputeMs => c.recompute_ms.to_string(),
+        FieldId::VolMWindow => c.vol_m_window_seconds.to_string(),
+        FieldId::SetupWindow => c.setup_window_sec.to_string(),
+        FieldId::SetupVolRatio => format!("{:.2}", c.setup_vol_ratio),
+        FieldId::SetupPricePct => format!("{:.2}", c.setup_price_pct),
+        FieldId::MinVolAlert => c.min_volume_for_alert.to_string(),
+        FieldId::MinPriceAlert => format!("{:.2}", c.min_price_for_alert),
+        FieldId::AlertCooldown => c.alert_cooldown_sec.to_string(),
+        FieldId::MinChange => format!("{:.1}", c.min_change_percent),
+        FieldId::MaxChange => format!("{:.1}", c.max_change_percent),
+        FieldId::MinVolume => c.min_volume.to_string(),
+        FieldId::MaxVolume => c.max_volume.to_string(),
+        FieldId::MinPrice => format!("{:.2}", c.min_price),
+        FieldId::MaxPrice => format!("{:.2}", c.max_price),
+    }
+}
+
+/// Stores one parsed field value in the config (validation happens afterwards, in `Config::validate`).
+fn apply_field(c: &mut Config, id: FieldId, v: f64) {
+    match id {
+        FieldId::MinMcap => c.min_market_cap = v,
+        FieldId::MaxMcap => c.max_market_cap = v,
+        FieldId::FallbackPoll => c.refresh_interval_seconds = v as u64,
+        FieldId::RankTrack => c.rank_tracking_interval_seconds = v as u64,
+        FieldId::RecomputeMs => c.recompute_ms = v as u64,
+        FieldId::VolMWindow => c.vol_m_window_seconds = v as u64,
+        FieldId::SetupWindow => c.setup_window_sec = v as u64,
+        FieldId::SetupVolRatio => c.setup_vol_ratio = v,
+        FieldId::SetupPricePct => c.setup_price_pct = v,
+        FieldId::MinVolAlert => c.min_volume_for_alert = v as i64,
+        FieldId::MinPriceAlert => c.min_price_for_alert = v,
+        FieldId::AlertCooldown => c.alert_cooldown_sec = v as u64,
+        FieldId::MinChange => c.min_change_percent = v,
+        FieldId::MaxChange => c.max_change_percent = v,
+        FieldId::MinVolume => c.min_volume = v as i64,
+        FieldId::MaxVolume => c.max_volume = v as i64,
+        FieldId::MinPrice => c.min_price = v,
+        FieldId::MaxPrice => c.max_price = v,
+    }
+}
+
 fn inputs_from(c: &Config) -> Vec<String> {
-    vec![
-        format!("{:.0}", c.min_market_cap),
-        format!("{:.0}", c.max_market_cap),
-        format!("{:.2}", c.setup_vol_ratio),
-        format!("{:.2}", c.setup_price_pct),
-        c.refresh_interval_seconds.to_string(),
-        c.rank_tracking_interval_seconds.to_string(),
-        c.setup_window_sec.to_string(),
-        c.min_volume_for_alert.to_string(),
-        format!("{:.2}", c.min_price_for_alert),
-        c.vol_m_window_seconds.to_string(),
-        format!("{:.1}", c.min_change_percent),
-        format!("{:.1}", c.max_change_percent),
-        c.min_volume.to_string(),
-        c.max_volume.to_string(),
-        format!("{:.2}", c.min_price),
-        format!("{:.2}", c.max_price),
-    ]
+    FIELDS.iter().map(|f| input_text(c, f.id)).collect()
+}
+
+/// The config after applying every input to `base` and validating. `Err(i)` is the first field
+/// whose text does not parse.
+fn config_from_inputs(base: &Config, inputs: &[String]) -> Result<Config, usize> {
+    let mut c = base.clone();
+    for (i, f) in FIELDS.iter().enumerate() {
+        let v = parse_field(&inputs[i], f.kind).ok_or(i)?;
+        apply_field(&mut c, f.id, v);
+    }
+    c.validate();
+    Ok(c)
+}
+
+/// Display filters from the (possibly unsaved) inputs; unparseable fields count as 0 (off).
+fn filters_from_inputs(inputs: &[String]) -> Filters {
+    let v = |id: FieldId| {
+        let i = field_index(id);
+        parse_field(&inputs[i], FIELDS[i].kind).unwrap_or(0.0)
+    };
+    Filters {
+        min_mcap: v(FieldId::MinMcap),
+        max_mcap: v(FieldId::MaxMcap),
+        min_change_pct: v(FieldId::MinChange),
+        max_change_pct: v(FieldId::MaxChange),
+        min_volume: v(FieldId::MinVolume) as i64,
+        max_volume: v(FieldId::MaxVolume) as i64,
+        min_price: v(FieldId::MinPrice),
+        max_price: v(FieldId::MaxPrice),
+    }
+}
+
+/// Next (or previous) option after the one in `cur`; an unknown value goes to the first option.
+fn cycle_choice(cur: &str, opts: &[u64], back: bool) -> String {
+    let n = opts.len();
+    let next = match cur.trim().parse::<u64>().ok().and_then(|v| opts.iter().position(|&o| o == v)) {
+        Some(i) if back => (i + n - 1) % n,
+        Some(i) => (i + 1) % n,
+        None => 0,
+    };
+    opts[next].to_string()
 }
 
 pub fn parse_field(s: &str, kind: FieldKind) -> Option<f64> {
@@ -738,6 +822,7 @@ pub fn parse_field(s: &str, kind: FieldKind) -> Option<f64> {
         FieldKind::Smart => parse_smart(s),
         FieldKind::Float => s.parse::<f64>().ok().filter(|v| v.is_finite()),
         FieldKind::Int => s.parse::<u64>().ok().map(|v| v as f64),
+        FieldKind::Choice(opts) => s.parse::<u64>().ok().filter(|v| opts.contains(v)).map(|v| v as f64),
     }
 }
 
@@ -837,5 +922,217 @@ mod tests {
         app.on_tick(base + Duration::from_millis(500));
         assert_eq!(app.tickers[0].symbol, "B");
         assert_eq!(app.last_recompute, base + Duration::from_millis(500));
+    }
+
+    fn set(inputs: &mut [String], id: FieldId, v: &str) {
+        inputs[field_index(id)] = v.to_string();
+    }
+
+    fn test_app(cfg: Config) -> (App, std::sync::mpsc::Receiver<()>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (htx, _hrx) = std::sync::mpsc::channel();
+        (App::new(cfg, PathBuf::from("target/test-config/unused-app-config.json"), tx, htx, None), rx)
+    }
+
+    #[test]
+    fn settings_labels_are_the_planned_ones() {
+        let labels: Vec<&str> = FIELDS.iter().map(|f| f.label).collect();
+        for want in [
+            "Fallback Poll (s)",
+            "SETUP Window (s)",
+            "SETUP Volume Ratio",
+            "SETUP Price %",
+            "Alert Cooldown (s)",
+            "Recompute (ms)",
+            "Vol/m Window (s)",
+        ] {
+            assert!(labels.contains(&want), "missing {want}");
+        }
+        for gone in ["Refresh Rate (s)", "Spike Vol Ratio", "Pump Price Pct", "Baseline Window", "Delta Window (s)"] {
+            assert!(!labels.contains(&gone), "{gone} still listed");
+        }
+    }
+
+    #[test]
+    fn every_field_id_is_listed_once_and_found_by_name() {
+        for (i, f) in FIELDS.iter().enumerate() {
+            assert_eq!(field_index(f.id), i);
+            assert_eq!(FIELDS.iter().filter(|g| g.id == f.id).count(), 1);
+        }
+        assert_eq!(FIELDS[field_index(FieldId::RecomputeMs)].label, "Recompute (ms)");
+        assert_eq!(FIELDS[field_index(FieldId::FallbackPoll)].label, "Fallback Poll (s)");
+        assert_eq!(FIELDS[field_index(FieldId::AlertCooldown)].label, "Alert Cooldown (s)");
+        assert_eq!(FIELDS[field_index(FieldId::MaxPrice)].label, "Max Price");
+    }
+
+    #[test]
+    fn every_field_roundtrips_settings_to_config() {
+        let c = Config {
+            min_market_cap: 5e8,
+            max_market_cap: 2e9,
+            refresh_interval_seconds: 7,
+            rank_tracking_interval_seconds: 45,
+            recompute_ms: 500,
+            vol_m_window_seconds: 90,
+            setup_window_sec: 600,
+            setup_vol_ratio: 3.5,
+            setup_price_pct: 7.25,
+            min_volume_for_alert: 25_000,
+            min_price_for_alert: 0.5,
+            alert_cooldown_sec: 45,
+            min_change_percent: 2.5,
+            max_change_percent: 80.5,
+            min_volume: 1_000,
+            max_volume: 90_000_000,
+            min_price: 0.25,
+            max_price: 20.0,
+            ..Config::default()
+        };
+        let inputs = inputs_from(&c);
+        assert_eq!(inputs.len(), FIELDS.len());
+        // starting from different values, the inputs bring every field to `c`
+        let got = config_from_inputs(&Config::default(), &inputs).unwrap();
+        assert_eq!(got, c);
+        // fields outside Settings are left alone
+        let base = Config { blacklisted_tickers: vec!["ZZZ".into()], stream_enabled: false, ..Config::default() };
+        let got = config_from_inputs(&base, &inputs).unwrap();
+        assert_eq!(got.blacklisted_tickers, vec!["ZZZ".to_string()]);
+        assert!(!got.stream_enabled);
+    }
+
+    #[test]
+    fn default_config_survives_a_settings_roundtrip() {
+        let c = Config::default();
+        assert_eq!(config_from_inputs(&c, &inputs_from(&c)).unwrap(), c);
+    }
+
+    #[test]
+    fn out_of_range_inputs_clamp_like_validate() {
+        let mut inputs = inputs_from(&Config::default());
+        set(&mut inputs, FieldId::FallbackPoll, "0");
+        set(&mut inputs, FieldId::RankTrack, "2");
+        set(&mut inputs, FieldId::VolMWindow, "5");
+        set(&mut inputs, FieldId::SetupWindow, "0");
+        set(&mut inputs, FieldId::AlertCooldown, "0");
+        set(&mut inputs, FieldId::SetupVolRatio, "0");
+        set(&mut inputs, FieldId::SetupPricePct, "-3");
+        let c = config_from_inputs(&Config::default(), &inputs).unwrap();
+        assert_eq!(c.refresh_interval_seconds, 1);
+        assert_eq!(c.rank_tracking_interval_seconds, 5);
+        assert_eq!(c.vol_m_window_seconds, 30);
+        assert_eq!(c.setup_window_sec, 300);
+        assert_eq!(c.alert_cooldown_sec, 120);
+        assert_eq!(c.setup_vol_ratio, 2.2);
+        assert_eq!(c.setup_price_pct, 10.0);
+    }
+
+    #[test]
+    fn unparseable_inputs_are_rejected_with_the_field_index() {
+        for (id, bad) in [
+            (FieldId::RecomputeMs, "750"),
+            (FieldId::RecomputeMs, "abc"),
+            (FieldId::RecomputeMs, ""),
+            (FieldId::FallbackPoll, "-1"),
+            (FieldId::FallbackPoll, "1.5"),
+            (FieldId::AlertCooldown, "x"),
+            (FieldId::SetupVolRatio, "abc"),
+            (FieldId::SetupWindow, ""),
+            (FieldId::VolMWindow, "-5"),
+        ] {
+            let mut inputs = inputs_from(&Config::default());
+            set(&mut inputs, id, bad);
+            assert_eq!(config_from_inputs(&Config::default(), &inputs), Err(field_index(id)), "{id:?} = {bad:?}");
+        }
+    }
+
+    #[test]
+    fn recompute_is_a_two_way_choice() {
+        assert_eq!(parse_field("500", FieldKind::Choice(RECOMPUTE_CHOICES)), Some(500.0));
+        assert_eq!(parse_field("1000", FieldKind::Choice(RECOMPUTE_CHOICES)), Some(1000.0));
+        assert_eq!(parse_field("250", FieldKind::Choice(RECOMPUTE_CHOICES)), None);
+        assert!(matches!(FIELDS[field_index(FieldId::RecomputeMs)].kind, FieldKind::Choice(o) if o == [500, 1000]));
+        assert_eq!(cycle_choice("1000", RECOMPUTE_CHOICES, false), "500");
+        assert_eq!(cycle_choice("500", RECOMPUTE_CHOICES, false), "1000");
+        assert_eq!(cycle_choice("500", RECOMPUTE_CHOICES, true), "1000");
+        assert_eq!(cycle_choice("junk", RECOMPUTE_CHOICES, false), "500");
+    }
+
+    #[test]
+    fn recompute_field_toggles_with_keys_and_ignores_typing() {
+        use crossterm::event::KeyEvent;
+        let (mut app, _rx) = test_app(Config::default());
+        app.view = View::SetupConfig;
+        app.focus = field_index(FieldId::RecomputeMs);
+        let key = |c: KeyCode| KeyEvent::new(c, KeyModifiers::NONE);
+        app.on_key(key(KeyCode::Char('7')));
+        app.on_key(key(KeyCode::Backspace));
+        assert_eq!(app.inputs[app.focus], "1000");
+        app.on_key(key(KeyCode::Right));
+        assert_eq!(app.inputs[app.focus], "500");
+        app.on_key(key(KeyCode::Char(' ')));
+        assert_eq!(app.inputs[app.focus], "1000");
+        app.on_key(key(KeyCode::Left));
+        assert_eq!(app.inputs[app.focus], "500");
+    }
+
+    #[test]
+    fn preview_filters_read_fields_by_name() {
+        let mut inputs = inputs_from(&Config::default());
+        set(&mut inputs, FieldId::MinMcap, "500K");
+        set(&mut inputs, FieldId::MaxMcap, "2B");
+        set(&mut inputs, FieldId::MinChange, "5");
+        set(&mut inputs, FieldId::MaxChange, "90");
+        set(&mut inputs, FieldId::MinVolume, "1000");
+        set(&mut inputs, FieldId::MaxVolume, "5000000");
+        set(&mut inputs, FieldId::MinPrice, "0.5");
+        set(&mut inputs, FieldId::MaxPrice, "15");
+        // alert and timing fields must not leak into the filters
+        set(&mut inputs, FieldId::SetupVolRatio, "9");
+        set(&mut inputs, FieldId::AlertCooldown, "77");
+        let f = filters_from_inputs(&inputs);
+        assert_eq!(f.min_mcap, 500_000.0);
+        assert_eq!(f.max_mcap, 2e9);
+        assert_eq!((f.min_change_pct, f.max_change_pct), (5.0, 90.0));
+        assert_eq!((f.min_volume, f.max_volume), (1000, 5_000_000));
+        assert_eq!((f.min_price, f.max_price), (0.5, 15.0));
+        // a half-typed value counts as off
+        set(&mut inputs, FieldId::MaxPrice, "1.");
+        set(&mut inputs, FieldId::MinPrice, "x");
+        assert_eq!(filters_from_inputs(&inputs).min_price, 0.0);
+    }
+
+    #[test]
+    fn preview_filters_follow_the_app_inputs() {
+        let (mut app, _rx) = test_app(Config::default());
+        let i = field_index(FieldId::MinPrice);
+        app.inputs[i] = "3".into();
+        assert_eq!(app.preview_filters().min_price, 3.0);
+    }
+
+    #[test]
+    fn saving_settings_applies_the_config_without_a_fetch() {
+        let (mut app, rx) = test_app(Config { max_market_cap: 0.0, ..Config::default() });
+        app.inputs = inputs_from(&app.cfg);
+        set(&mut app.inputs, FieldId::AlertCooldown, "30");
+        set(&mut app.inputs, FieldId::RecomputeMs, "500");
+        set(&mut app.inputs, FieldId::FallbackPoll, "9");
+        set(&mut app.inputs, FieldId::SetupWindow, "120");
+        app.view = View::SetupConfig;
+        app.commit_config();
+        assert!(app.view == View::SetupMenu);
+        assert_eq!(app.cfg.alert_cooldown_sec, 30);
+        assert_eq!(app.cfg.recompute_ms, 500);
+        assert_eq!(app.cfg.refresh_interval_seconds, 9);
+        assert_eq!(app.cfg.setup_window_sec, 120);
+        assert!(rx.try_recv().is_err(), "saving settings must not trigger a fetch");
+
+        // an invalid field keeps the screen open, focuses the field and changes nothing
+        app.view = View::SetupConfig;
+        set(&mut app.inputs, FieldId::RecomputeMs, "750");
+        app.commit_config();
+        assert!(app.view == View::SetupConfig);
+        assert_eq!(app.focus, field_index(FieldId::RecomputeMs));
+        assert_eq!(app.config_err.as_deref(), Some("Invalid Recompute (ms)"));
+        assert_eq!(app.cfg.recompute_ms, 500);
     }
 }
