@@ -232,7 +232,18 @@ impl App {
         if self.stream_ok() { LIST_REFRESH } else { self.cfg.refresh_interval_seconds.max(1) }
     }
 
+    /// Tells the stream which tickers to hold: the list plus lingering ones.
+    fn send_subscriptions(&self) {
+        if let Some(tx) = &self.stream_tx {
+            let _ = tx.send(stream::Cmd::SetTickers(self.engine.subscribe_ids()));
+        }
+    }
+
     pub fn on_tick(&mut self, now: Instant) {
+        self.engine.set_rest_feeds_series(!self.stream_ok());
+        if self.engine.expire_series(now) {
+            self.send_subscriptions();
+        }
         if let Some(last) = self.last_fetch {
             self.next_refresh = last + Duration::from_secs(self.poll_interval());
         }
@@ -256,10 +267,6 @@ impl App {
                     Err(e) => self.error = Some(e),
                     Ok(f) => {
                         self.error = None;
-                        if let Some(tx) = &self.stream_tx {
-                            let ids = f.tickers.iter().map(|t| t.ticker_id).filter(|&i| i != 0).collect();
-                            let _ = tx.send(stream::Cmd::SetTickers(ids));
-                        }
                         self.all = f.tickers.clone();
                         self.group = f.group;
                         self.session = f.session;
@@ -267,6 +274,7 @@ impl App {
                         let out = self.engine.process(f.tickers, self.sort_key, self.sort_desc, now);
                         self.tickers = out.active;
                         self.blacklisted = out.blacklisted;
+                        self.send_subscriptions();
                         if out.new_alerts > 0 {
                             self.last_alert_at = Some(now);
                         }
@@ -282,6 +290,9 @@ impl App {
                 }
             }
             Msg::Stream(st) => {
+                if st.connections != self.stream.connections {
+                    self.engine.on_stream_reconnect();
+                }
                 self.stream = st;
                 self.stream_status_at = Some(Instant::now());
             }

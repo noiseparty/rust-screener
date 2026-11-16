@@ -6,6 +6,7 @@ mod engine;
 mod health;
 mod paths;
 mod scraper;
+mod series;
 mod session;
 mod stream;
 mod ui;

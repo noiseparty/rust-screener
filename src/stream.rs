@@ -62,6 +62,8 @@ pub struct Update {
 #[derive(Debug, Clone, Default)]
 pub struct StreamStatus {
     pub connected: bool,
+    /// Number of connections established so far; a change means a reconnect.
+    pub connections: u64,
     pub subs: usize,
     pub msgs_per_sec: f64,
     pub last_msg: Option<Instant>,
@@ -547,8 +549,13 @@ fn run_connection(sh: &mut Shared, tls: &Arc<rustls::ClientConfig>, got_data: &m
     c.wait_for("SUBACK", CONNECT_TIMEOUT, |p| *p == Packet::SubAck { id })?;
 
     sh.st.connected = true;
+    sh.st.connections += 1;
     sh.st.error = None;
     sh.st.last_msg = None;
+    // Sent before any quote of this connection so the app can drop state from the previous one.
+    if !sh.emit() {
+        return Ok(());
+    }
     let mut subscribed: HashSet<u64> = HashSet::new();
     let mut batch: Vec<Update> = Vec::new();
     let mut count = 0u32;

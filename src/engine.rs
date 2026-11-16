@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::scraper::Ticker;
+use crate::series::{Ingest, Obs, SeriesStore, Source};
 use crate::session::Session;
 use crate::stream::Update;
 use std::cmp::Ordering;
@@ -10,8 +11,10 @@ pub const MAX_ROWS: usize = 100;
 pub const MAX_CANDLES: usize = 390;
 /// A stream quote older than this no longer overrides the REST row.
 pub const LIVE_FRESH: Duration = Duration::from_secs(15);
-/// Consecutive lower cumulative-volume readings after which the lower value is believed.
-const LOWER_VOL_ACCEPT: u8 = 3;
+/// Assumed stream subscription cap (to be confirmed by the probe); members come first.
+pub const MAX_SUBS: usize = 100;
+/// Series history kept beyond the longest window a consumer looks back over.
+const SERIES_MARGIN: Duration = Duration::from_secs(60);
 pub const RATE_WINDOWS: [(&str, u64); 4] = [("20m", 1200), ("5m", 300), ("1m", 60), ("30s", 30)];
 
 /// One-minute OHLCV bar built from observed price/volume samples.
@@ -162,11 +165,8 @@ pub struct Output {
 /// Latest accepted stream quote of one ticker.
 #[derive(Debug, Clone, Copy)]
 struct Live {
-    last_ms: i64,
-    last_seq: u64,
     price: f64,
     volume: i64,
-    lower: u8,
     at: Instant,
 }
 
@@ -188,6 +188,9 @@ pub struct Engine {
     live: HashMap<u64, Live>,
     /// tickerId -> position in `latest`.
     index: HashMap<u64, usize>,
+    series: SeriesStore,
+    /// Whether REST rows may write to the series (false while the stream is healthy).
+    rest_feeds_series: bool,
 }
 
 impl Engine {
@@ -207,7 +210,40 @@ impl Engine {
             last_cum_vol: HashMap::new(),
             live: HashMap::new(),
             index: HashMap::new(),
+            series: SeriesStore::new(series_horizon(&Thresholds::from_config(cfg))),
+            rest_feeds_series: true,
         }
+    }
+
+    /// Receive-time series of every listed (or lingering) ticker, keyed by tickerId.
+    #[allow(dead_code)] // read by Vol/m, SETUP and probe mode (later steps)
+    pub fn series(&self) -> &SeriesStore {
+        &self.series
+    }
+
+    /// The stream reconnected: everything it delivered before is stale.
+    pub fn on_stream_reconnect(&mut self) {
+        self.series.clear_all();
+    }
+
+    /// REST rows write to the series only while the stream is not healthy; otherwise the
+    /// series holds stream samples only and a quiet ticker keeps its history.
+    pub fn set_rest_feeds_series(&mut self, on: bool) {
+        self.rest_feeds_series = on;
+    }
+
+    /// Drops lingering series whose 60 s ran out. Returns true when the subscription set changed.
+    pub fn expire_series(&mut self, now: Instant) -> bool {
+        self.series.expire(now)
+    }
+
+    /// Tickers to subscribe: the current list first, then lingering ones, up to `MAX_SUBS`.
+    pub fn subscribe_ids(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self.latest.iter().map(|t| t.ticker_id).filter(|&i| i != 0).collect();
+        ids.truncate(MAX_SUBS);
+        let room = MAX_SUBS - ids.len();
+        ids.extend(self.series.lingering().into_iter().take(room));
+        ids
     }
 
     /// Folds a batch of stream quotes into the last processed rows (price, volume, change %, market cap).
@@ -215,32 +251,26 @@ impl Engine {
     pub fn apply_quotes(&mut self, updates: &[Update], session: Session, now: Instant) -> bool {
         let mut changed = false;
         for u in updates {
-            // Extended-hours price is taken from pPrice when present (unverified against the
-            // live stream); regular hours use close.
+            // Extended-hours price is taken from pPrice when present; regular hours use close.
             let ext = matches!(session, Session::Pre | Session::After);
             let px = if ext { u.p_price.filter(|p| *p > 0.0).or(u.close) } else { u.close };
             // A message without price or volume is dropped, never read as zero.
             let (Some(px), Some(vol)) = (px.filter(|p| *p > 0.0), u.volume) else { continue };
+            // The series store owns ordering, lower-volume and session/date rules.
+            let obs = Obs { id: u.id, src: Source::Stream, ms: u.trade_ms, seq: u.seq, px: Some(px), vol: Some(vol), at: u.recv };
+            match self.series.ingest(obs) {
+                Ingest::Dropped => continue,
+                Ingest::Unchanged => {
+                    // Nothing new, but the stream is alive for this ticker.
+                    if let Some(l) = self.live.get_mut(&u.id) {
+                        l.at = now;
+                    }
+                    continue;
+                }
+                Ingest::Stored => {}
+            }
             let vol = vol as i64;
-            let prev = self.live.get(&u.id).copied();
-            if let Some(p) = prev {
-                if u.trade_ms < p.last_ms || (u.trade_ms == p.last_ms && u.seq <= p.last_seq) {
-                    continue;
-                }
-            }
-            let mut lower = 0;
-            if let Some(p) = prev.filter(|p| vol < p.volume) {
-                lower = p.lower + 1;
-                if lower < LOWER_VOL_ACCEPT {
-                    self.live.insert(u.id, Live { lower, ..p });
-                    continue;
-                }
-                lower = 0;
-            }
-            self.live.insert(
-                u.id,
-                Live { last_ms: u.trade_ms, last_seq: u.seq, price: px, volume: vol, lower, at: now },
-            );
+            self.live.insert(u.id, Live { price: px, volume: vol, at: now });
             let Some(&i) = self.index.get(&u.id) else { continue };
             let t = &mut self.latest[i];
             if vol > t.volume {
@@ -260,15 +290,17 @@ impl Engine {
     }
 
     /// Replaces a REST row's price/volume/change by the freshest stream quote, if there is one.
-    fn overlay_live(&self, t: &mut Ticker, now: Instant) {
+    /// Returns true when it did.
+    fn overlay_live(&self, t: &mut Ticker, now: Instant) -> bool {
         let Some(l) = self.live.get(&t.ticker_id).filter(|l| now.saturating_duration_since(l.at) <= LIVE_FRESH) else {
-            return;
+            return false;
         };
         t.price = l.price;
         t.volume = l.volume;
         if let Some(c) = change_from(t.prev_close, l.price) {
             t.change_ratio = c;
         }
+        true
     }
 
     pub fn candles(&self, sym: &str) -> Option<&VecDeque<Candle>> {
@@ -304,6 +336,7 @@ impl Engine {
     pub fn apply_config(&mut self, cfg: &Config) {
         self.filters = Filters::from_config(cfg);
         self.th = Thresholds::from_config(cfg);
+        self.series.set_horizon(series_horizon(&self.th));
         while self.alerts.len() > self.th.max_alerts {
             self.alerts.pop_front();
         }
@@ -343,8 +376,25 @@ impl Engine {
         let mut new_alerts = 0;
         let mut latest = Vec::with_capacity(tickers.len());
 
+        self.series.set_members(tickers.iter().map(|t| t.ticker_id), now);
+        self.series.expire(now);
+        let wall_ms = wall.timestamp_millis();
+
         for mut t in tickers {
-            self.overlay_live(&mut t, now);
+            let overlaid = self.overlay_live(&mut t, now);
+            // A row still carrying a fresh stream quote adds nothing; otherwise REST feeds the
+            // series when the stream is down. REST has no volume of 0 for a trading ticker, so 0 means missing.
+            if self.rest_feeds_series && !overlaid {
+                self.series.ingest(Obs {
+                    id: t.ticker_id,
+                    src: Source::Rest,
+                    ms: wall_ms,
+                    seq: 0,
+                    px: Some(t.price),
+                    vol: u64::try_from(t.volume).ok().filter(|v| *v > 0),
+                    at: now,
+                });
+            }
             let is_bl = self.blacklist.contains(&t.symbol);
             let shown = is_bl || self.filters.matches(&t);
 
@@ -494,6 +544,11 @@ impl Engine {
         }
         ctx.retain(|_, h| h.last().is_some_and(|&(at, _)| now.saturating_duration_since(at) < Duration::from_secs(300)));
     }
+}
+
+/// Series history to keep: the longest look-back window plus a margin.
+fn series_horizon(th: &Thresholds) -> Duration {
+    th.delta_window.max(th.baseline_window) + SERIES_MARGIN
 }
 
 /// Change ratio versus the previous close, when that is known.
@@ -718,10 +773,17 @@ mod tests {
         assert_eq!(e.alerts().len(), 10);
     }
 
+    /// Exchange stamps in tests are offsets from one fixed point near now, so they share a
+    /// session with the REST rows that `process` stamps with the wall clock.
+    fn base_ms() -> i64 {
+        static BASE: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+        *BASE.get_or_init(|| chrono::Utc::now().timestamp_millis())
+    }
+
     fn upd(id: u64, ms: i64, seq: u64, px: f64, vol: u64) -> Update {
         Update {
             id,
-            trade_ms: ms,
+            trade_ms: base_ms() + ms,
             seq,
             close: Some(px),
             p_price: None,
@@ -781,7 +843,7 @@ mod tests {
         u.p_price = Some(1.8);
         e.apply_quotes(&[u.clone()], Session::Pre, t0);
         assert_eq!(e.reapply("change", true).active[0].price, 1.8);
-        u.trade_ms = 2000;
+        u.trade_ms = base_ms() + 2000;
         e.apply_quotes(&[u], Session::Reg, t0);
         assert_eq!(e.reapply("change", true).active[0].price, 1.5);
     }
@@ -797,5 +859,150 @@ mod tests {
         // once the stream goes quiet the REST row wins again
         let out = e.process(vec![rest], "change", true, t0 + LIVE_FRESH + Duration::from_secs(5));
         assert_eq!((out.active[0].price, out.active[0].volume), (1.2, 1200));
+    }
+
+    #[test]
+    fn stream_quotes_feed_series() {
+        let (mut e, t0) = live_engine();
+        let mut u = upd(7, 1000, 1, 1.5, 1600);
+        u.recv = t0 + Duration::from_secs(2);
+        e.apply_quotes(&[u], Session::Reg, t0);
+        let mut u = upd(7, 2000, 1, 1.6, 1800);
+        u.recv = t0 + Duration::from_secs(6);
+        e.apply_quotes(&[u], Session::Reg, t0);
+        let s = e.series();
+        // the REST sample taken at t0 was replaced by the source switch
+        assert_eq!(s.len(7), 2);
+        assert_eq!(s.vol_at(7, t0 + Duration::from_secs(4)), Some(1600));
+        assert_eq!(s.px_at(7, t0 + Duration::from_secs(6)), Some(1.6));
+        assert_eq!(s.vol_at(7, t0 + Duration::from_secs(1)), None);
+    }
+
+    #[test]
+    fn series_uses_p_price_in_extended_hours_and_close_in_regular() {
+        let (mut e, t0) = live_engine();
+        let mut u = upd(7, 1000, 1, 0.0, 1100);
+        u.close = None;
+        u.p_price = Some(1.8);
+        u.recv = t0;
+        e.apply_quotes(&[u.clone()], Session::Pre, t0);
+        assert_eq!(e.series().latest(7).unwrap().px, 1.8);
+        // Reg ignores pPrice; without close the message is dropped
+        u.trade_ms += 1000;
+        e.apply_quotes(&[u], Session::Reg, t0);
+        assert_eq!(e.series().len(7), 1);
+        assert_eq!(e.series().latest(7).unwrap().px, 1.8);
+    }
+
+    #[test]
+    fn dropped_quotes_do_not_reach_series_or_rows() {
+        let (mut e, t0) = live_engine();
+        let mut u = upd(7, 1000, 1, 1.5, 1600);
+        u.recv = t0;
+        e.apply_quotes(&[u], Session::Reg, t0);
+        let mut old = upd(7, 500, 1, 9.0, 9000);
+        old.recv = t0 + Duration::from_secs(3);
+        assert!(!e.apply_quotes(&[old], Session::Reg, t0));
+        assert_eq!(e.series().latest(7).unwrap().vol, 1600);
+    }
+
+    #[test]
+    fn rest_rows_feed_series_only_while_enabled() {
+        let (mut e, t0) = live_engine();
+        // live_engine's first process() fed the series from REST
+        assert_eq!(e.series().len(7), 1);
+        assert_eq!(e.series().latest(7).unwrap().vol, 1000);
+        e.set_rest_feeds_series(false);
+        let rest = |v: i64| Ticker { ticker_id: 7, prev_close: 1.0, ..tk("A", 1.2, v, 0.2, 5e6) };
+        e.process(vec![rest(1500)], "change", true, t0 + Duration::from_secs(5));
+        assert_eq!(e.series().latest(7).unwrap().vol, 1000);
+        e.set_rest_feeds_series(true);
+        e.process(vec![rest(1500)], "change", true, t0 + Duration::from_secs(10));
+        assert_eq!(e.series().latest(7).unwrap().vol, 1500);
+        assert_eq!(e.series().len(7), 2);
+        assert_eq!(e.series().vol_at(7, t0 + Duration::from_secs(8)), Some(1000));
+    }
+
+    #[test]
+    fn row_with_fresh_stream_quote_does_not_feed_rest_sample() {
+        let (mut e, t0) = live_engine();
+        let mut u = upd(7, 1000, 1, 1.5, 1600);
+        u.recv = t0 + Duration::from_secs(1);
+        e.apply_quotes(&[u], Session::Reg, t0 + Duration::from_secs(1));
+        let rest = Ticker { ticker_id: 7, prev_close: 1.0, ..tk("A", 1.2, 1200, 0.2, 5e6) };
+        e.process(vec![rest], "change", true, t0 + Duration::from_secs(5));
+        let s = e.series();
+        assert_eq!(s.len(7), 1);
+        assert_eq!(s.latest(7).unwrap().vol, 1600);
+    }
+
+    #[test]
+    fn reconnect_clears_series() {
+        let (mut e, _) = live_engine();
+        assert_eq!(e.series().len(7), 1);
+        e.on_stream_reconnect();
+        assert_eq!(e.series().len(7), 0);
+    }
+
+    #[test]
+    fn rest_zero_volume_and_unkeyed_rows_are_not_recorded() {
+        let mut e = engine();
+        let t0 = Instant::now();
+        let z = Ticker { ticker_id: 5, ..tk("Z", 1.0, 0, 0.1, 0.0) };
+        e.process(vec![z, tk("U", 1.0, 10, 0.1, 0.0)], "change", true, t0);
+        assert_eq!(e.series().len(5), 0);
+        assert_eq!(e.series().len(0), 0);
+    }
+
+    #[test]
+    fn leaving_ticker_lingers_then_is_evicted_and_unsubscribed() {
+        let mut e = engine();
+        let t0 = Instant::now();
+        let a = Ticker { ticker_id: 1, ..tk("A", 1.0, 100, 0.1, 0.0) };
+        let b = Ticker { ticker_id: 2, ..tk("B", 1.0, 100, 0.1, 0.0) };
+        e.process(vec![a.clone(), b], "change", true, t0);
+        assert_eq!(e.subscribe_ids(), vec![1, 2]);
+        e.process(vec![a.clone()], "change", true, t0 + Duration::from_secs(5));
+        // members first, then the lingering one
+        assert_eq!(e.subscribe_ids(), vec![1, 2]);
+        assert_eq!(e.series().len(2), 1);
+        assert!(!e.expire_series(t0 + Duration::from_secs(64)));
+        assert!(e.expire_series(t0 + Duration::from_secs(65)));
+        assert_eq!(e.subscribe_ids(), vec![1]);
+        assert_eq!(e.series().len(2), 0);
+        // coming back within the linger keeps the series
+        e.process(vec![a.clone(), Ticker { ticker_id: 2, ..tk("B", 1.0, 150, 0.1, 0.0) }], "change", true, t0 + Duration::from_secs(70));
+        e.process(vec![a], "change", true, t0 + Duration::from_secs(80));
+        e.process(vec![Ticker { ticker_id: 2, ..tk("B", 1.0, 160, 0.1, 0.0) }], "change", true, t0 + Duration::from_secs(90));
+        assert_eq!(e.series().len(2), 2);
+    }
+
+    #[test]
+    fn subscribe_ids_cap_members_first() {
+        let mut e = engine();
+        let t0 = Instant::now();
+        let rows: Vec<Ticker> = (1..=120u64).map(|i| Ticker { ticker_id: i, ..tk(&format!("T{i}"), 1.0, 10, 0.1, 0.0) }).collect();
+        e.process(rows.clone(), "change", true, t0);
+        e.process(rows[..90].to_vec(), "change", true, t0 + Duration::from_secs(5));
+        let ids = e.subscribe_ids();
+        assert_eq!(ids.len(), MAX_SUBS);
+        assert_eq!(ids[..90], (1..=90u64).collect::<Vec<_>>()[..]);
+    }
+
+    #[test]
+    fn config_change_updates_series_horizon() {
+        let mut cfg = Config::default();
+        cfg.max_market_cap = 0.0;
+        cfg.delta_window_seconds = 30;
+        cfg.baseline_window_sec = 30;
+        let mut e = Engine::new(&cfg);
+        let t0 = Instant::now();
+        let a = |v: i64| Ticker { ticker_id: 1, ..tk("A", 1.0, v, 0.1, 0.0) };
+        for i in 0..=200u64 {
+            e.process(vec![a(100 + i as i64)], "change", true, t0 + Duration::from_secs(i));
+        }
+        // 30 s window + 60 s margin
+        assert!(e.series().len(1) < 95);
+        assert!(e.series().vol_at(1, t0 + Duration::from_secs(110)).is_some());
     }
 }
