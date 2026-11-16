@@ -1,5 +1,5 @@
 use crate::config::{Config, CONFIG_PATH, FILTER_NAMES};
-use crate::engine::{compare, AlertKind, Engine, Filters};
+use crate::engine::{AlertKind, Engine, Filters};
 use crate::health::CheckResult;
 use crate::scraper::{Fetched, Ticker};
 use crate::session::Session;
@@ -349,13 +349,7 @@ impl App {
                         self.sort_key = key;
                         self.sort_desc = true;
                     }
-                    let (sk, sd) = (self.sort_key, self.sort_desc);
-                    self.tickers.sort_by(|a, b| {
-                        let o = compare(a, b, sk);
-                        if sd { o.reverse() } else { o }
-                    });
-                    self.resync_row();
-                    self.request_fetch();
+                    self.reapply_local();
                 }
             }
             KeyCode::Char('f') => {
@@ -497,9 +491,15 @@ impl App {
         self.config_err = None;
         self.save_config();
         self.view = View::SetupMenu;
-        if self.running {
-            self.request_fetch();
-        }
+        self.reapply_local();
+    }
+
+    /// Re-filter and re-sort the last fetched data without a network fetch.
+    fn reapply_local(&mut self) {
+        let out = self.engine.reapply(self.sort_key, self.sort_desc);
+        self.tickers = out.active;
+        self.blacklisted = out.blacklisted;
+        self.resync_row();
     }
 
     fn key_blacklist(&mut self, k: KeyEvent) {

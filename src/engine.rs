@@ -158,6 +158,8 @@ pub struct Engine {
     pub th: Thresholds,
     pub blacklist: BTreeSet<String>,
     last: HashMap<String, Ticker>,
+    /// Every ticker from the most recent process() call, for local re-filter/re-sort.
+    latest: Vec<Ticker>,
     vol_hist: HashMap<String, Vec<(Instant, i64)>>,
     price_hist: HashMap<String, Vec<(Instant, f64)>>,
     rank_hist: HashMap<String, HashMap<String, Vec<(Instant, usize)>>>,
@@ -175,6 +177,7 @@ impl Engine {
             th: Thresholds::from_config(cfg),
             blacklist: cfg.blacklisted_tickers.iter().cloned().collect(),
             last: HashMap::new(),
+            latest: Vec::new(),
             vol_hist: HashMap::new(),
             price_hist: HashMap::new(),
             rank_hist: HashMap::new(),
@@ -255,6 +258,7 @@ impl Engine {
         let mut active = Vec::with_capacity(tickers.len());
         let mut blacklisted = Vec::new();
         let mut new_alerts = 0;
+        let mut latest = Vec::with_capacity(tickers.len());
 
         for mut t in tickers {
             let is_bl = self.blacklist.contains(&t.symbol);
@@ -313,6 +317,7 @@ impl Engine {
 
             self.record_sample(&t.symbol, epoch, t.price, t.volume);
             self.last.insert(t.symbol.clone(), t.clone());
+            latest.push(t.clone());
             if is_bl {
                 blacklisted.push(t)
             } else if shown {
@@ -346,7 +351,43 @@ impl Engine {
             self.alerts.pop_front();
         }
 
+        let ranks: HashMap<&str, i32> = active.iter().map(|t| (t.symbol.as_str(), t.rank_change)).collect();
+        for t in latest.iter_mut() {
+            if let Some(&r) = ranks.get(t.symbol.as_str()) {
+                t.rank_change = r;
+            }
+        }
+        self.latest = latest;
+
         Output { active, blacklisted, new_alerts }
+    }
+
+    /// Re-filter and re-sort the last processed tickers with the current filters,
+    /// blacklist and sort. Records no history, ticks, alerts or rank samples.
+    pub fn reapply(&self, sort_key: &str, sort_desc: bool) -> Output {
+        let mut active = Vec::new();
+        let mut blacklisted = Vec::new();
+        for t in &self.latest {
+            if self.blacklist.contains(&t.symbol) {
+                blacklisted.push(t.clone());
+            } else if self.filters.matches(t) {
+                active.push(t.clone());
+            }
+        }
+        let rank_key = if sort_key == "mov" { "change" } else { sort_key };
+        let rank_desc = sort_key == "mov" || sort_desc;
+        active.sort_by(|a, b| {
+            let o = compare(a, b, rank_key);
+            if rank_desc { o.reverse() } else { o }
+        });
+        active.truncate(MAX_ROWS);
+        if sort_key == "mov" {
+            active.sort_by(|a, b| {
+                let o = compare(a, b, sort_key);
+                if sort_desc { o.reverse() } else { o }
+            });
+        }
+        Output { active, blacklisted, new_alerts: 0 }
     }
 
     fn track_ranks(&mut self, active: &mut [Ticker], sort_key: &str, sort_desc: bool, now: Instant) {
@@ -522,6 +563,23 @@ mod tests {
         assert_eq!(e.vol_hist["F"].len(), 1);
         assert_eq!(e.price_hist["F"].len(), 1);
         assert!(e.candles("F").is_some());
+    }
+
+    #[test]
+    fn reapply_refilters_and_resorts_without_recording() {
+        let mut e = engine();
+        let t0 = Instant::now();
+        e.process(vec![tk("A", 1.0, 1000, 0.1, 0.0), tk("B", 9.0, 1000, 0.2, 0.0)], "change", true, t0);
+        let alerts = e.alerts.len();
+        let samples = e.vol_hist["A"].len();
+        let out = e.reapply("price", true);
+        assert_eq!(out.active[0].symbol, "B");
+        e.filters.min_price = 5.0;
+        let out = e.reapply("price", true);
+        assert_eq!(out.active.len(), 1);
+        assert_eq!(out.active[0].symbol, "B");
+        assert_eq!(e.alerts.len(), alerts);
+        assert_eq!(e.vol_hist["A"].len(), samples);
     }
 
     #[test]
