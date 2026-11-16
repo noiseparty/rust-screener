@@ -18,10 +18,10 @@ Status as of 2026-11-16. Spec: `docs/plan.md` (user decisions, authoritative) an
 - [x] 12. Ranking (`c49d618`)
 - [x] 13. SETUP (`e6dd601`)
 - [x] 14. Cooldown + sticky badge (`859037e`)
+- [x] 15. NEW rework (`91007d7`)
 
 ## Unfinished: build steps in order
 
-- [ ] 15. **NEW rework** (item 14): listed now and not in last 30 min; silent seeding on startup / session change / filter change.
 - [ ] 16. **Rate panel tabs** (item 16): `t` toggles New Highs/Lows (default) and Up/Down ticks; tab remembered in config.
 - [ ] 17. **Settings consolidation** (item 20): Fallback Poll, SETUP fields, Alert Cooldown, Recompute (ms), Vol/m Window, named field lookups in preview.
 - [ ] 18. **Candle storage** (item 21 part B): append 1-minute candles to `data\candles-YYYY-MM-DD.csv`, reload today's on start, delete previous days on launch.
