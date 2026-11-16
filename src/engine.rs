@@ -21,6 +21,10 @@ const SERIES_MARGIN: Duration = Duration::from_secs(60);
 pub const FILTER_GRACE: Duration = Duration::from_secs(60);
 /// An alert's Status label stays at least this long (and for the whole cooldown if that is longer).
 pub const BADGE_HOLD: Duration = Duration::from_secs(60);
+/// NEW: a symbol on the list now that was not on it for this long.
+pub const NEW_QUIET: Duration = Duration::from_secs(1800);
+/// How long a symbol's last time on the list is remembered.
+const LISTED_KEEP: Duration = Duration::from_secs(2400);
 pub const RATE_WINDOWS: [(&str, u64); 4] = [("20m", 1200), ("5m", 300), ("1m", 60), ("30s", 30)];
 /// Badge priority when several alert kinds of one symbol are held: first wins.
 const BADGE_PRIORITY: [AlertKind; 4] = [AlertKind::Setup, AlertKind::Pump, AlertKind::Spike, AlertKind::New];
@@ -203,6 +207,11 @@ pub struct Engine {
     /// Symbols that stopped passing, and when. Visible (dimmed) for `FILTER_GRACE`, then hidden.
     failing_since: HashMap<String, Instant>,
     alerts: VecDeque<Alert>,
+    /// When each symbol was last on the list (passing the display filters, blacklisted included).
+    /// Drives NEW; entries older than `LISTED_KEEP` are dropped.
+    listed: HashMap<String, Instant>,
+    /// The next fetched list only seeds `listed` and raises no NEW (startup, session change).
+    reseed: bool,
     /// When each alert kind (by `AlertKind::slot`) last fired for a symbol. Drives the cooldown
     /// and the Status badge; entries older than the badge hold are dropped.
     fired: HashMap<String, [Option<Instant>; 4]>,
@@ -232,6 +241,8 @@ impl Engine {
             passing: HashSet::new(),
             failing_since: HashMap::new(),
             alerts: VecDeque::new(),
+            listed: HashMap::new(),
+            reseed: true,
             fired: HashMap::new(),
             ticks: VecDeque::new(),
             candles: HashMap::new(),
@@ -383,8 +394,24 @@ impl Engine {
         }
     }
 
+    /// The trading session changed: the next fetched list only seeds NEW, it raises none.
+    pub fn on_session_change(&mut self) {
+        self.reseed = true;
+    }
+
+    /// Records every row that passes the display filters as listed at `now`, raising nothing.
+    fn seed_listed(&mut self, now: Instant) {
+        for t in &self.latest {
+            if self.filters.matches(t) {
+                self.listed.insert(t.symbol.clone(), now);
+            }
+        }
+    }
+
     pub fn apply_config(&mut self, cfg: &Config) {
-        self.filters = Filters::from_config(cfg);
+        let new_filters = Filters::from_config(cfg);
+        let filters_changed = new_filters != self.filters;
+        self.filters = new_filters;
         self.th = Thresholds::from_config(cfg);
         self.series.set_horizon(series_horizon(&self.th));
         while self.alerts.len() > self.th.max_alerts {
@@ -393,6 +420,10 @@ impl Engine {
         // New filters apply at once: nothing lingers from the old ones.
         self.failing_since.clear();
         self.passing = self.latest.iter().filter(|t| self.shown(t)).map(|t| t.symbol.clone()).collect();
+        // Whatever the new filters let through is the list as of now, not a flood of new symbols.
+        if filters_changed {
+            self.seed_listed(Instant::now());
+        }
     }
 
     /// Passes the display filters now (blacklisted rows are listed separately, never here).
@@ -426,10 +457,8 @@ impl Engine {
 
     pub fn process(&mut self, tickers: Vec<Ticker>, sort_key: &str, sort_desc: bool, now: Instant) -> Output {
         let wall = chrono::Local::now();
-        let clock = wall.format("%H:%M:%S").to_string();
         let epoch = wall.timestamp();
         let th = self.th;
-        let mut new_alerts = 0;
         let mut latest = Vec::with_capacity(tickers.len());
 
         self.series.set_members(tickers.iter().map(|t| t.ticker_id), now);
@@ -457,22 +486,12 @@ impl Engine {
             (t.vol_rate, t.vol_partial, t.vol_stale) =
                 vol_m(&self.series, t.ticker_id, now, th.vol_m_window, self.feed_stale);
 
-            // NEW keeps its trigger here (rework: step 15). SETUP is evaluated on the recompute tick.
-            match self.last.get(&t.symbol) {
-                None => {
-                    if shown && !is_bl {
-                        let base = self.setup_base(t.ticker_id, now);
-                        if self.raise(AlertKind::New, &t, base, now, &clock) {
-                            new_alerts += 1;
-                        }
-                    }
-                }
-                Some(prev) => {
-                    if shown && t.price > prev.price {
-                        self.ticks.push_back((now, true));
-                    } else if shown && t.price < prev.price {
-                        self.ticks.push_back((now, false));
-                    }
+            // NEW and SETUP are evaluated on the recompute tick.
+            if let Some(prev) = self.last.get(&t.symbol) {
+                if shown && t.price > prev.price {
+                    self.ticks.push_back((now, true));
+                } else if shown && t.price < prev.price {
+                    self.ticks.push_back((now, false));
                 }
             }
 
@@ -495,19 +514,24 @@ impl Engine {
         self.latest = latest;
 
         // A fetch is rare and changes membership: rank and filter at once instead of at the next tick.
-        new_alerts += self.recompute(now);
+        let new_alerts = self.recompute_at(now, true);
         let mut out = self.reapply(sort_key, sort_desc, now);
         out.new_alerts = new_alerts;
         out
     }
 
     /// The recompute tick: re-ranks the full board (Mov), moves rows into or out of the filter
-    /// grace and raises SETUP alerts from the stream-fed rows. Stream quotes only change data;
-    /// the display follows on this tick. Returns the number of alerts raised.
+    /// grace and raises NEW and SETUP alerts from the stream-fed rows. Stream quotes only change
+    /// data; the display follows on this tick. Returns the number of alerts raised.
     pub fn recompute(&mut self, now: Instant) -> usize {
+        self.recompute_at(now, false)
+    }
+
+    /// `fetched`: the list was just replaced by a fetch (the first one after a reseed seeds NEW).
+    fn recompute_at(&mut self, now: Instant, fetched: bool) -> usize {
         self.rank_board(now);
         self.update_display(now);
-        let raised = self.evaluate_setups(now);
+        let raised = self.evaluate_new(now, fetched) + self.evaluate_setups(now);
         let hold = self.badge_hold();
         self.fired.retain(|_, f| {
             for at in f.iter_mut() {
@@ -517,6 +541,40 @@ impl Engine {
             }
             f.iter().any(Option::is_some)
         });
+        raised
+    }
+
+    /// NEW: a row on the list (passing the display filters) now that was not on it in the last
+    /// `NEW_QUIET`. While a reseed is pending (startup, session change) ticks do nothing and the
+    /// next fetched list is only recorded. Blacklisted rows are recorded but never alert.
+    fn evaluate_new(&mut self, now: Instant, fetched: bool) -> usize {
+        if self.reseed {
+            if fetched {
+                self.reseed = false;
+                self.seed_listed(now);
+            }
+            return 0;
+        }
+        let mut hits = Vec::new();
+        for t in &self.latest {
+            if !self.filters.matches(t) {
+                continue;
+            }
+            let gone = self.listed.get(&t.symbol).is_none_or(|&at| now.saturating_duration_since(at) >= NEW_QUIET);
+            if gone && !self.blacklist.contains(&t.symbol) {
+                hits.push(t.clone());
+            }
+        }
+        self.seed_listed(now);
+        self.listed.retain(|_, at| now.saturating_duration_since(*at) < LISTED_KEEP);
+        let clock = chrono::Local::now().format("%H:%M:%S").to_string();
+        let mut raised = 0;
+        for t in hits {
+            let base = self.setup_base(t.ticker_id, now);
+            if self.raise(AlertKind::New, &t, base, now, &clock) {
+                raised += 1;
+            }
+        }
         raised
     }
 
@@ -843,6 +901,11 @@ mod tests {
         e.process(vec![t], "change", true, t0 + Duration::from_secs(secs))
     }
 
+    /// The first fetch (an empty list) only seeds NEW; rows listed after it are new.
+    fn seed_empty(e: &mut Engine, now: Instant) {
+        e.process(vec![], "change", true, now);
+    }
+
     fn kinds(e: &Engine) -> Vec<AlertKind> {
         e.alerts().iter().map(|a| a.kind).collect()
     }
@@ -852,7 +915,7 @@ mod tests {
         let mut e = setup_engine();
         let t0 = Instant::now();
         let out = setup_row(&mut e, t0, 0, 1.0, 1000);
-        assert_eq!(out.active[0].status, "NEW");
+        assert_eq!(out.active[0].status, "");
         // exactly 2.2x and exactly +10%, 300 s later
         let out = setup_row(&mut e, t0, 300, 1.10, 2200);
         assert_eq!(out.active[0].status, "SETUP");
@@ -870,7 +933,7 @@ mod tests {
             setup_row(&mut e, t0, 0, 1.0, 1000);
             let out = setup_row(&mut e, t0, 300, price, vol);
             assert_eq!(out.new_alerts, 0, "price {price} vol {vol}");
-            assert_eq!(kinds(&e), vec![AlertKind::New]);
+            assert!(kinds(&e).is_empty());
         }
     }
 
@@ -888,9 +951,9 @@ mod tests {
         // S: volume x5, flat price (a SPIKE before). P: price +50%, flat volume (a PUMP before).
         let out = e.process(rows(5000, 1.5), "symbol", false, t0 + Duration::from_secs(5));
         assert_eq!(out.new_alerts, 0);
-        // only the sticky NEW badge from the first list is still shown
-        assert!(out.active.iter().all(|t| t.status == "NEW"));
-        assert!(kinds(&e).iter().all(|k| *k == AlertKind::New));
+        // nothing was raised (the first list only seeds NEW)
+        assert!(out.active.iter().all(|t| t.status.is_empty()));
+        assert!(kinds(&e).is_empty());
         // the tick counter still follows the price move
         assert_eq!(e.tick_rates(t0 + Duration::from_secs(6))[3], (0, 1));
     }
@@ -916,8 +979,8 @@ mod tests {
         assert_eq!(out.new_alerts, 0);
         // a ticker's very first sample is its own baseline
         let mut e = setup_engine();
-        assert_eq!(setup_row(&mut e, t0, 0, 5.0, 9000).active[0].status, "NEW");
-        assert_eq!(kinds(&e), vec![AlertKind::New]);
+        assert_eq!(setup_row(&mut e, t0, 0, 5.0, 9000).new_alerts, 0);
+        assert!(kinds(&e).is_empty());
     }
 
     #[test]
@@ -1012,10 +1075,10 @@ mod tests {
         let at = |s: u64| t0 + Duration::from_secs(s);
         stream_setup_hit(&mut e, t0);
         // the stream data alone raises nothing; the tick does
-        assert_eq!(kinds(&e), vec![AlertKind::New]);
+        assert!(kinds(&e).is_empty());
 
         assert_eq!(e.recompute(at(310)), 1);
-        assert_eq!(kinds(&e), vec![AlertKind::New, AlertKind::Setup]);
+        assert_eq!(kinds(&e), vec![AlertKind::Setup]);
         assert_eq!(status_at(&e, at(310)), "SETUP");
         let a = e.alerts().back().unwrap();
         assert_eq!((a.at, a.prev_vol, a.curr_vol), (at(310), 1000, 2200));
@@ -1025,10 +1088,10 @@ mod tests {
             assert_eq!(e.recompute(at(s)), 0, "second {s}");
         }
         assert_eq!(e.recompute(at(429)), 0);
-        assert_eq!(kinds(&e).len(), 2);
+        assert_eq!(kinds(&e).len(), 1);
         // once the cooldown (120 s) is over and the condition still holds, it is raised again
         assert_eq!(e.recompute(at(430)), 1);
-        assert_eq!(kinds(&e).len(), 3);
+        assert_eq!(kinds(&e).len(), 2);
     }
 
     #[test]
@@ -1089,6 +1152,7 @@ mod tests {
         let mut e = setup_engine();
         let t0 = Instant::now();
         let at = |s: u64| t0 + Duration::from_secs(s);
+        seed_empty(&mut e, t0);
         setup_row(&mut e, t0, 0, 1.0, 1000);
         // NEW at 0 s, default cooldown 120 s: still shown until 120 s, gone at 120 s
         assert_eq!(status_at(&e, at(0)), "NEW");
@@ -1107,6 +1171,7 @@ mod tests {
         e.apply_config(&Config { alert_cooldown_sec: 20, max_market_cap: 0.0, ..Config::default() });
         let t0 = Instant::now();
         let at = |s: u64| t0 + Duration::from_secs(s);
+        seed_empty(&mut e, t0);
         e.process(vec![tk("A", 1.0, 1000, 0.1, 0.0)], "change", true, t0);
         assert_eq!(status_at(&e, at(59)), "NEW");
         assert_eq!(status_at(&e, at(60)), "");
@@ -1119,7 +1184,9 @@ mod tests {
         let mut e = engine();
         let t0 = Instant::now();
         let at = |s: u64| t0 + Duration::from_secs(s);
+        seed_empty(&mut e, t0);
         e.process(vec![Ticker { ticker_id: 1, ..tk("A", 1.0, 1000, 0.1, 0.0) }], "change", true, t0);
+        assert_eq!(status_at(&e, at(1)), "NEW");
         let a = tk("A", 1.0, 1000, 0.1, 0.0);
         assert!(e.raise(AlertKind::Setup, &a, None, at(30), ""));
         assert_eq!(status_at(&e, at(31)), "SETUP");
@@ -1170,6 +1237,170 @@ mod tests {
         e.apply_config(&cfg);
         let out = setup_row(&mut e, t0, 60, 1.05, 1500);
         assert_eq!(out.active[0].status, "SETUP");
+    }
+
+    /// Engine whose first fetch (an empty list) has seeded NEW; rows listed after it are new.
+    fn seeded_engine(t0: Instant) -> Engine {
+        let mut e = setup_engine();
+        seed_empty(&mut e, t0);
+        e
+    }
+
+    /// Lists the given symbols (ids 1..) over REST at `secs` after `t0`.
+    fn list(e: &mut Engine, t0: Instant, secs: u64, syms: &[&str]) -> Output {
+        let rows = syms.iter().enumerate().map(|(i, s)| Ticker { ticker_id: i as u64 + 1, ..tk(s, 1.0, 1000, 0.1, 0.0) });
+        e.process(rows.collect(), "change", true, t0 + Duration::from_secs(secs))
+    }
+
+    #[test]
+    fn startup_list_only_seeds_new() {
+        let t0 = Instant::now();
+        let mut e = setup_engine();
+        let out = list(&mut e, t0, 0, &["A", "B", "C"]);
+        assert_eq!(out.new_alerts, 0);
+        assert!(kinds(&e).is_empty());
+        assert!(out.active.iter().all(|t| t.status.is_empty()));
+        // the same list again, and ticks in between, stay silent
+        assert_eq!(e.recompute(t0 + Duration::from_secs(1)), 0);
+        assert_eq!(list(&mut e, t0, 5, &["A", "B", "C"]).new_alerts, 0);
+        // a symbol that joins afterwards is NEW
+        let out = list(&mut e, t0, 10, &["A", "B", "C", "D"]);
+        assert_eq!(out.new_alerts, 1);
+        assert_eq!(kinds(&e), vec![AlertKind::New]);
+        assert_eq!(e.alerts().back().unwrap().symbol, "D");
+        assert_eq!(out.active.iter().find(|t| t.symbol == "D").unwrap().status, "NEW");
+    }
+
+    #[test]
+    fn leaving_and_returning_within_30_min_is_not_new() {
+        let t0 = Instant::now();
+        let mut e = seeded_engine(t0);
+        assert_eq!(list(&mut e, t0, 0, &["A", "B"]).new_alerts, 2);
+        // B leaves the list; it comes back 29:59 after it was last listed
+        list(&mut e, t0, 60, &["A"]);
+        assert_eq!(list(&mut e, t0, 1799, &["A", "B"]).new_alerts, 0);
+        assert_eq!(kinds(&e).len(), 2);
+    }
+
+    #[test]
+    fn returning_after_30_min_is_new() {
+        let t0 = Instant::now();
+        let mut e = seeded_engine(t0);
+        list(&mut e, t0, 0, &["A", "B"]);
+        list(&mut e, t0, 60, &["A"]);
+        // B was last listed at 0 s: back at 1799 s is still too soon, 1800 s is NEW
+        assert_eq!(list(&mut e, t0, 1799, &["A"]).new_alerts, 0);
+        let out = list(&mut e, t0, 1800, &["A", "B"]);
+        assert_eq!(out.new_alerts, 1);
+        assert_eq!(e.alerts().back().unwrap().symbol, "B");
+        assert_eq!(kinds(&e).len(), 3);
+    }
+
+    #[test]
+    fn staying_listed_keeps_the_clock_running() {
+        let t0 = Instant::now();
+        let mut e = seeded_engine(t0);
+        list(&mut e, t0, 0, &["A"]);
+        // listed all the time, long past 30 min: never NEW again
+        for s in (60..=3600).step_by(60) {
+            assert_eq!(list(&mut e, t0, s, &["A"]).new_alerts, 0, "second {s}");
+        }
+        assert_eq!(kinds(&e).len(), 1);
+    }
+
+    #[test]
+    fn session_change_reseeds_silently() {
+        let t0 = Instant::now();
+        let mut e = seeded_engine(t0);
+        list(&mut e, t0, 0, &["A"]);
+        e.on_session_change();
+        // ticks before the next fetch raise nothing and do not use up the reseed
+        assert_eq!(e.recompute(t0 + Duration::from_secs(1)), 0);
+        // a brand new board arrives: seeded, no alerts
+        let out = list(&mut e, t0, 10, &["A", "X", "Y", "Z"]);
+        assert_eq!(out.new_alerts, 0);
+        assert_eq!(kinds(&e).len(), 1);
+        // afterwards NEW works as before
+        assert_eq!(list(&mut e, t0, 20, &["A", "X", "Y", "Z", "W"]).new_alerts, 1);
+        assert_eq!(e.alerts().back().unwrap().symbol, "W");
+    }
+
+    #[test]
+    fn filter_change_reseeds_silently() {
+        let t0 = Instant::now();
+        let mut e = seeded_engine(t0);
+        let rows = |e: &mut Engine, s: u64, extra: bool| {
+            let mut v = vec![
+                Ticker { ticker_id: 1, ..tk("A", 1.0, 1000, 0.1, 0.0) },
+                Ticker { ticker_id: 2, ..tk("B", 5.0, 1000, 0.1, 0.0) },
+            ];
+            if extra {
+                v.push(Ticker { ticker_id: 3, ..tk("C", 6.0, 1000, 0.1, 0.0) });
+            }
+            e.process(v, "change", true, t0 + Duration::from_secs(s))
+        };
+        // price filter: only A passes at first
+        let mut cfg = Config { max_market_cap: 0.0, max_price: 2.0, ..Config::default() };
+        e.apply_config(&cfg);
+        assert_eq!(rows(&mut e, 0, false).new_alerts, 1);
+        // the filter is widened: B now passes, but it is only a new view of the same list
+        cfg.max_price = 0.0;
+        e.apply_config(&cfg);
+        assert_eq!(e.recompute(t0 + Duration::from_secs(1)), 0);
+        assert_eq!(rows(&mut e, 2, true).new_alerts, 1, "only C, which was not on the list at the change");
+        assert_eq!(kinds(&e).len(), 2);
+        assert_eq!(e.alerts().back().unwrap().symbol, "C");
+    }
+
+    #[test]
+    fn symbol_failing_the_filter_is_off_the_list() {
+        let t0 = Instant::now();
+        let mut e = seeded_engine(t0);
+        e.filters.min_price = 0.5;
+        let row = |p: f64| Ticker { ticker_id: 1, ..tk("A", p, 1000, 0.1, 0.0) };
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        assert_eq!(e.process(vec![row(1.0)], "change", true, at(0)).new_alerts, 1);
+        // below the price filter for over 30 min (still in the REST list), then passing again
+        assert_eq!(e.process(vec![row(0.4)], "change", true, at(60)).new_alerts, 0);
+        assert_eq!(e.process(vec![row(0.4)], "change", true, at(1900)).new_alerts, 0);
+        assert_eq!(e.process(vec![row(1.0)], "change", true, at(1901)).new_alerts, 1);
+    }
+
+    #[test]
+    fn blacklisted_symbols_never_raise_new() {
+        let t0 = Instant::now();
+        let mut e = seeded_engine(t0);
+        e.toggle_blacklist("B");
+        assert_eq!(list(&mut e, t0, 0, &["A", "B"]).new_alerts, 1);
+        assert_eq!(kinds(&e).len(), 1);
+        // taking it off the blacklist is not an appearance: it has been on the list all along
+        e.toggle_blacklist("B");
+        assert_eq!(list(&mut e, t0, 10, &["A", "B"]).new_alerts, 0);
+    }
+
+    #[test]
+    fn new_follows_the_cooldown_and_badge() {
+        let t0 = Instant::now();
+        let mut e = seeded_engine(t0);
+        e.apply_config(&Config { alert_cooldown_sec: 4000, max_market_cap: 0.0, ..Config::default() });
+        list(&mut e, t0, 0, &["A"]);
+        list(&mut e, t0, 60, &[]);
+        // back after 30 min, but the (long) cooldown of the first NEW has not run out
+        assert_eq!(list(&mut e, t0, 1900, &["A"]).new_alerts, 0);
+        assert_eq!(kinds(&e).len(), 1);
+        // the badge from the first NEW is still held
+        assert_eq!(status_at(&e, t0 + Duration::from_secs(1900)), "NEW");
+    }
+
+    #[test]
+    fn listed_entries_are_pruned_after_40_min() {
+        let t0 = Instant::now();
+        let mut e = seeded_engine(t0);
+        list(&mut e, t0, 0, &["A", "B"]);
+        list(&mut e, t0, 2399, &["B"]);
+        assert!(e.listed.contains_key("A"));
+        list(&mut e, t0, 2400, &["B"]);
+        assert!(!e.listed.contains_key("A") && e.listed.contains_key("B"));
     }
 
     #[test]
@@ -1659,7 +1890,9 @@ mod tests {
         cfg.alert_history_max = 10;
         let mut e = Engine::new(&cfg);
         let ts: Vec<_> = (0..25).map(|i| tk(&format!("T{i}"), 1.0, 1, 0.1, 0.0)).collect();
-        e.process(ts, "change", true, Instant::now());
+        let now = Instant::now();
+        seed_empty(&mut e, now);
+        e.process(ts, "change", true, now);
         assert_eq!(e.alerts().len(), 10);
     }
 

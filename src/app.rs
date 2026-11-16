@@ -305,6 +305,9 @@ impl App {
                         self.last_ok_fetch = Some(Instant::now());
                         self.all = f.tickers.clone();
                         self.group = f.group;
+                        if f.session != self.session {
+                            self.engine.on_session_change();
+                        }
                         self.session = f.session;
                         let now = Instant::now();
                         let out = self.engine.process(f.tickers, self.sort_key, self.sort_desc, now);
