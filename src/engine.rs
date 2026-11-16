@@ -306,6 +306,8 @@ pub struct Engine {
     /// New-high / new-low tracking (design 2.8), fed by stream quotes only.
     hl: HighLow,
     candles: HashMap<String, VecDeque<Candle>>,
+    /// Start of the newest candle per symbol already handed to storage (or loaded from it).
+    stored_upto: HashMap<String, i64>,
     last_cum_vol: HashMap<String, i64>,
     live: HashMap<u64, Live>,
     /// tickerId -> position in `latest`.
@@ -335,6 +337,7 @@ impl Engine {
             ticks: VecDeque::new(),
             hl: HighLow::default(),
             candles: HashMap::new(),
+            stored_upto: HashMap::new(),
             last_cum_vol: HashMap::new(),
             live: HashMap::new(),
             index: HashMap::new(),
@@ -461,6 +464,44 @@ impl Engine {
 
     pub fn candles(&self, sym: &str) -> Option<&VecDeque<Candle>> {
         self.candles.get(sym)
+    }
+
+    /// Seeds the in-memory candles from storage (start of run) and marks them as stored.
+    /// Rows are taken in file order; the last `MAX_CANDLES` per symbol are kept.
+    pub fn load_candles(&mut self, rows: Vec<(String, Candle)>) {
+        for (sym, c) in rows {
+            let bars = self.candles.entry(sym.clone()).or_default();
+            if bars.back().is_some_and(|b| b.start >= c.start) {
+                continue;
+            }
+            bars.push_back(c);
+            if bars.len() > MAX_CANDLES {
+                bars.pop_front();
+            }
+            self.stored_upto.insert(sym, c.start);
+        }
+    }
+
+    /// Candles whose minute has ended by `now_epoch` and that are not stored yet, oldest first
+    /// per symbol. They are recorded before display filters, like all candles.
+    pub fn completed_candles(&self, now_epoch: i64) -> Vec<(String, Candle)> {
+        let mut out = Vec::new();
+        for (sym, bars) in &self.candles {
+            let done = self.stored_upto.get(sym).copied().unwrap_or(i64::MIN);
+            let first_new = bars.iter().rposition(|c| c.start <= done).map_or(0, |i| i + 1);
+            for c in bars.iter().skip(first_new).take_while(|c| c.start + 60 <= now_epoch) {
+                out.push((sym.clone(), *c));
+            }
+        }
+        out
+    }
+
+    /// Marks candles (as returned by `completed_candles`) as written to storage.
+    pub fn mark_stored(&mut self, rows: &[(String, Candle)]) {
+        for (sym, c) in rows {
+            let up = self.stored_upto.entry(sym.clone()).or_insert(i64::MIN);
+            *up = (*up).max(c.start);
+        }
     }
 
     /// Folds one price/cumulative-volume sample into the symbol's 1-minute candles.
@@ -1998,6 +2039,47 @@ mod tests {
         assert_eq!(c.len(), 2);
         assert_eq!((c[0].open, c[0].high, c[0].low, c[0].close, c[0].volume), (1.0, 1.5, 0.8, 0.8, 600));
         assert_eq!((c[1].start, c[1].open, c[1].volume), (660, 0.9, 100));
+    }
+
+    #[test]
+    fn completed_candles_are_taken_once() {
+        let mut e = engine();
+        let take = |e: &mut Engine, now| {
+            let rows = e.completed_candles(now);
+            e.mark_stored(&rows);
+            rows
+        };
+        e.record_sample("A", 600, 1.0, 1000);
+        e.record_sample("A", 660, 2.0, 1100);
+        e.record_sample("B", 610, 5.0, 10);
+        assert!(take(&mut e, 650).is_empty()); // minute 600 still running
+        let got = take(&mut e, 661);
+        assert_eq!(got.len(), 2);
+        assert!(got.iter().any(|(s, c)| s == "A" && c.start == 600) && got.iter().any(|(s, c)| s == "B" && c.start == 600));
+        assert!(take(&mut e, 700).is_empty());
+        let got = take(&mut e, 721); // minute 660 of A ended
+        assert_eq!(got.len(), 1);
+        assert_eq!((got[0].0.as_str(), got[0].1.start), ("A", 660));
+        assert!(take(&mut e, 10_000).is_empty());
+    }
+
+    #[test]
+    fn loaded_candles_are_not_stored_again() {
+        let mut e = engine();
+        let take = |e: &mut Engine, now| {
+            let rows = e.completed_candles(now);
+            e.mark_stored(&rows);
+            rows
+        };
+        let c = |start| Candle { start, open: 1.0, high: 1.0, low: 1.0, close: 1.0, volume: 1 };
+        e.load_candles(vec![("A".into(), c(600)), ("A".into(), c(660)), ("A".into(), c(660))]);
+        assert_eq!(e.candles("A").unwrap().len(), 2);
+        assert!(take(&mut e, 10_000).is_empty());
+        e.record_sample("A", 780, 2.0, 5); // a later minute appends after the reloaded ones
+        assert_eq!(e.candles("A").unwrap().len(), 3);
+        let got = take(&mut e, 10_000);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1.start, 780);
     }
 
     #[test]

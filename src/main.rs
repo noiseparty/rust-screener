@@ -9,6 +9,7 @@ mod probe;
 mod scraper;
 mod series;
 mod session;
+mod store;
 mod stream;
 mod ui;
 
@@ -114,6 +115,7 @@ fn main() {
     });
 
     let mut app = App::new(cfg, paths.config.clone(), fetch_tx, health_tx, stream_tx);
+    app.attach_candle_store(&paths.data);
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, &mut app, &msg_rx);
     ratatui::restore();

@@ -3,9 +3,10 @@ use crate::engine::{AlertKind, Engine, Filters};
 use crate::health::CheckResult;
 use crate::scraper::{Fetched, Ticker};
 use crate::session::Session;
+use crate::store::{self, CandleStore};
 use crate::stream::{self, StreamStatus};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
@@ -180,6 +181,8 @@ pub struct App {
     pub col_cursor: usize,
     pub chart_symbol: String,
     pub sel_symbol: Option<String>,
+    /// Candle storage; None until `attach_candle_store` (tests never write to disk).
+    candle_store: Option<CandleStore>,
 }
 
 impl App {
@@ -238,6 +241,7 @@ impl App {
             col_cursor: 0,
             chart_symbol: String::new(),
             sel_symbol: None,
+            candle_store: None,
         }
     }
 
@@ -288,7 +292,29 @@ impl App {
         self.last_ok_fetch.is_none_or(|t| now.saturating_duration_since(t) > limit)
     }
 
+    /// Turns on candle storage in `dir`: deletes earlier days' candle files, reloads today's
+    /// candles into the engine, and from then on appends each candle once its minute ends.
+    /// Storage problems never stop the screener; the missing history is simply not there.
+    pub fn attach_candle_store(&mut self, dir: &Path) {
+        let today = store::ny_date(chrono::Utc::now().timestamp());
+        let _ = store::purge_old(dir, today);
+        if let Ok(rows) = store::load(dir, today) {
+            self.engine.load_candles(rows);
+        }
+        self.candle_store = Some(CandleStore::new(dir));
+    }
+
+    /// Appends candles whose minute has ended. Failed writes are retried with the next batch.
+    fn store_completed(&mut self) {
+        let Some(store) = self.candle_store.as_mut() else { return };
+        let rows = self.engine.completed_candles(chrono::Utc::now().timestamp());
+        if !rows.is_empty() && store.append(&rows).is_ok() {
+            self.engine.mark_stored(&rows);
+        }
+    }
+
     pub fn on_tick(&mut self, now: Instant) {
+        self.store_completed();
         self.engine.set_rest_feeds_series(!self.stream_ok());
         let stale = self.feed_stale(now);
         self.engine.set_feed_stale(stale);
