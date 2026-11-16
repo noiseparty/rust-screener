@@ -128,6 +128,7 @@ pub struct App {
     pub filter_cursor: usize,
     pub col_cursor: usize,
     pub chart_symbol: String,
+    pub sel_symbol: Option<String>,
 }
 
 impl App {
@@ -172,6 +173,7 @@ impl App {
             filter_cursor: 0,
             col_cursor: 0,
             chart_symbol: String::new(),
+            sel_symbol: None,
         }
     }
 
@@ -214,7 +216,7 @@ impl App {
                         if out.new_alerts > 0 {
                             self.last_alert_at = Some(now);
                         }
-                        self.row = self.row.min(self.tickers.len().saturating_sub(1));
+                        self.resync_row();
                         self.last_update = Some(chrono::Local::now().format("%H:%M:%S").to_string());
                     }
                 }
@@ -325,13 +327,13 @@ impl App {
             KeyCode::Char('r') => self.request_fetch(),
             KeyCode::Left | KeyCode::Char('h') => self.sel_col = self.sel_col.saturating_sub(1),
             KeyCode::Right | KeyCode::Char('l') => self.sel_col = (self.sel_col + 1).min(ncols.saturating_sub(1)),
-            KeyCode::Up | KeyCode::Char('k') => self.row = self.row.saturating_sub(1),
+            KeyCode::Up | KeyCode::Char('k') => self.move_row(self.row.saturating_sub(1)),
             KeyCode::Down | KeyCode::Char('j') => {
-                self.row = (self.row + 1).min(self.tickers.len().saturating_sub(1))
+                self.move_row(self.row + 1)
             }
-            KeyCode::PageUp => self.row = self.row.saturating_sub(10),
-            KeyCode::PageDown => self.row = (self.row + 10).min(self.tickers.len().saturating_sub(1)),
-            KeyCode::Home | KeyCode::Char('g') => self.row = 0,
+            KeyCode::PageUp => self.move_row(self.row.saturating_sub(10)),
+            KeyCode::PageDown => self.move_row(self.row + 10),
+            KeyCode::Home | KeyCode::Char('g') => self.move_row(0),
             KeyCode::Enter => {
                 if let Some(t) = self.tickers.get(self.row) {
                     self.chart_symbol = t.symbol.clone();
@@ -352,6 +354,7 @@ impl App {
                         let o = compare(a, b, sk);
                         if sd { o.reverse() } else { o }
                     });
+                    self.resync_row();
                     self.request_fetch();
                 }
             }
@@ -373,14 +376,30 @@ impl App {
         }
     }
 
+    fn move_row(&mut self, row: usize) {
+        self.row = row.min(self.tickers.len().saturating_sub(1));
+        self.sel_symbol = self.tickers.get(self.row).map(|t| t.symbol.clone());
+    }
+
+    /// Re-derive the cursor row from the selected symbol after the list changes.
+    fn resync_row(&mut self) {
+        let pos = self
+            .sel_symbol
+            .as_ref()
+            .and_then(|s| self.tickers.iter().position(|t| &t.symbol == s));
+        match pos {
+            Some(i) => self.row = i,
+            None => self.move_row(self.row),
+        }
+    }
+
     fn key_chart(&mut self, k: KeyEvent) {
         match k.code {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Esc | KeyCode::Backspace | KeyCode::Enter | KeyCode::Char('d') => self.view = View::Dashboard,
             KeyCode::Up | KeyCode::Char('k') | KeyCode::Down | KeyCode::Char('j') => {
                 let down = matches!(k.code, KeyCode::Down | KeyCode::Char('j'));
-                let last = self.tickers.len().saturating_sub(1);
-                self.row = if down { (self.row + 1).min(last) } else { self.row.saturating_sub(1) };
+                self.move_row(if down { self.row + 1 } else { self.row.saturating_sub(1) });
                 if let Some(t) = self.tickers.get(self.row) {
                     self.chart_symbol = t.symbol.clone();
                 }
@@ -633,5 +652,23 @@ mod tests {
         assert_eq!(parse_field("5", FieldKind::Int), Some(5.0));
         assert_eq!(parse_field("-5", FieldKind::Int), None);
         assert_eq!(parse_field("5.5", FieldKind::Int), None);
+    }
+
+    #[test]
+    fn cursor_follows_selected_symbol_across_resort() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (htx, _hrx) = std::sync::mpsc::channel();
+        let mut app = App::new(Config::default(), tx, htx);
+        let mk = |s: &str| Ticker { symbol: s.into(), ..Default::default() };
+        app.tickers = vec![mk("A"), mk("B"), mk("C")];
+        app.move_row(1);
+        assert_eq!(app.sel_symbol.as_deref(), Some("B"));
+        app.tickers = vec![mk("C"), mk("A"), mk("B")];
+        app.resync_row();
+        assert_eq!(app.row, 2);
+        app.tickers = vec![mk("C"), mk("A")];
+        app.resync_row();
+        assert_eq!(app.row, 1);
+        assert_eq!(app.sel_symbol.as_deref(), Some("A"));
     }
 }
