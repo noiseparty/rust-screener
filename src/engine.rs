@@ -19,7 +19,11 @@ pub const MIN_VOL_M_WINDOW_SECS: u64 = 30;
 const SERIES_MARGIN: Duration = Duration::from_secs(60);
 /// A row that stops passing a display filter stays visible, dimmed, this long.
 pub const FILTER_GRACE: Duration = Duration::from_secs(60);
+/// An alert's Status label stays at least this long (and for the whole cooldown if that is longer).
+pub const BADGE_HOLD: Duration = Duration::from_secs(60);
 pub const RATE_WINDOWS: [(&str, u64); 4] = [("20m", 1200), ("5m", 300), ("1m", 60), ("30s", 30)];
+/// Badge priority when several alert kinds of one symbol are held: first wins.
+const BADGE_PRIORITY: [AlertKind; 4] = [AlertKind::Setup, AlertKind::Pump, AlertKind::Spike, AlertKind::New];
 
 /// One-minute OHLCV bar built from observed price/volume samples.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -43,6 +47,11 @@ pub enum AlertKind {
 }
 
 impl AlertKind {
+    /// Index into the per-symbol fire times.
+    fn slot(self) -> usize {
+        self as usize
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             AlertKind::New => "NEW",
@@ -142,6 +151,8 @@ pub struct Thresholds {
     pub setup_window: Duration,
     pub min_volume_for_alert: i64,
     pub min_price_for_alert: f64,
+    /// Minimum time between two alerts of the same kind for one symbol.
+    pub alert_cooldown: Duration,
     pub rank_interval: Duration,
     pub vol_m_window: Duration,
     pub max_alerts: usize,
@@ -155,6 +166,7 @@ impl Thresholds {
             setup_window: Duration::from_secs(c.setup_window_sec),
             min_volume_for_alert: c.min_volume_for_alert,
             min_price_for_alert: c.min_price_for_alert,
+            alert_cooldown: Duration::from_secs(c.alert_cooldown_sec),
             rank_interval: Duration::from_secs(c.rank_tracking_interval_seconds),
             vol_m_window: Duration::from_secs(c.vol_m_window_seconds.max(MIN_VOL_M_WINDOW_SECS)),
             max_alerts: c.alert_history_max,
@@ -191,6 +203,9 @@ pub struct Engine {
     /// Symbols that stopped passing, and when. Visible (dimmed) for `FILTER_GRACE`, then hidden.
     failing_since: HashMap<String, Instant>,
     alerts: VecDeque<Alert>,
+    /// When each alert kind (by `AlertKind::slot`) last fired for a symbol. Drives the cooldown
+    /// and the Status badge; entries older than the badge hold are dropped.
+    fired: HashMap<String, [Option<Instant>; 4]>,
     /// Price tick direction events across the board: (time, is_up).
     ticks: VecDeque<(Instant, bool)>,
     candles: HashMap<String, VecDeque<Candle>>,
@@ -217,6 +232,7 @@ impl Engine {
             passing: HashSet::new(),
             failing_since: HashMap::new(),
             alerts: VecDeque::new(),
+            fired: HashMap::new(),
             ticks: VecDeque::new(),
             candles: HashMap::new(),
             last_cum_vol: HashMap::new(),
@@ -441,39 +457,23 @@ impl Engine {
             (t.vol_rate, t.vol_partial, t.vol_stale) =
                 vol_m(&self.series, t.ticker_id, now, th.vol_m_window, self.feed_stale);
 
-            // The value `setup_window` ago comes from the series store (receive time).
-            let base = self.setup_base(t.ticker_id, now);
-            let base_vol = base.map(|b| b.0 as i64);
-            let base_price = base.map(|b| b.1);
-
-            let kind = match self.last.get(&t.symbol) {
-                None => Some(AlertKind::New),
+            // NEW keeps its trigger here (rework: step 15). SETUP is evaluated on the recompute tick.
+            match self.last.get(&t.symbol) {
+                None => {
+                    if shown && !is_bl {
+                        let base = self.setup_base(t.ticker_id, now);
+                        if self.raise(AlertKind::New, &t, base, now, &clock) {
+                            new_alerts += 1;
+                        }
+                    }
+                }
                 Some(prev) => {
                     if shown && t.price > prev.price {
                         self.ticks.push_back((now, true));
                     } else if shown && t.price < prev.price {
                         self.ticks.push_back((now, false));
                     }
-                    let eligible = t.volume >= th.min_volume_for_alert && t.price >= th.min_price_for_alert;
-                    // SPIKE and PUMP are hidden for now: only SETUP (both conditions) is raised.
-                    (eligible && setup_met(&th, base, t.volume, t.price)).then_some(AlertKind::Setup)
                 }
-            };
-
-            if let Some(kind) = kind.filter(|_| shown && !is_bl) {
-                self.alerts.push_back(Alert {
-                    at: now,
-                    clock: clock.clone(),
-                    symbol: t.symbol.clone(),
-                    kind,
-                    prev_vol: base_vol.unwrap_or(-1),
-                    curr_vol: t.volume,
-                    prev_price: base_price.unwrap_or(-1.0),
-                    curr_price: t.price,
-                    change_ratio: t.change_ratio,
-                });
-                new_alerts += 1;
-                t.status = kind.label().to_string();
             }
 
             self.record_sample(&t.symbol, epoch, t.price, t.volume);
@@ -495,17 +495,105 @@ impl Engine {
         self.latest = latest;
 
         // A fetch is rare and changes membership: rank and filter at once instead of at the next tick.
-        self.recompute(now);
+        new_alerts += self.recompute(now);
         let mut out = self.reapply(sort_key, sort_desc, now);
         out.new_alerts = new_alerts;
         out
     }
 
-    /// The recompute tick: re-ranks the full board (Mov) and moves rows into or out of the
-    /// filter grace. Stream quotes only change data; the display follows on this tick.
-    pub fn recompute(&mut self, now: Instant) {
+    /// The recompute tick: re-ranks the full board (Mov), moves rows into or out of the filter
+    /// grace and raises SETUP alerts from the stream-fed rows. Stream quotes only change data;
+    /// the display follows on this tick. Returns the number of alerts raised.
+    pub fn recompute(&mut self, now: Instant) -> usize {
         self.rank_board(now);
         self.update_display(now);
+        let raised = self.evaluate_setups(now);
+        let hold = self.badge_hold();
+        self.fired.retain(|_, f| {
+            for at in f.iter_mut() {
+                if at.is_some_and(|a| now.saturating_duration_since(a) >= hold) {
+                    *at = None;
+                }
+            }
+            f.iter().any(Option::is_some)
+        });
+        raised
+    }
+
+    /// SETUP on every shown, eligible row at its current price and volume. The cooldown stops a
+    /// row that keeps meeting the limits from being raised again at each tick.
+    fn evaluate_setups(&mut self, now: Instant) -> usize {
+        // Without fresh data the look-back window only slides over old samples; nothing is new.
+        if self.feed_stale {
+            return 0;
+        }
+        let th = self.th;
+        let mut hits = Vec::new();
+        for t in &self.latest {
+            let eligible = t.volume >= th.min_volume_for_alert && t.price >= th.min_price_for_alert;
+            if !eligible || !self.shown(t) || !self.can_fire(&t.symbol, AlertKind::Setup, now) {
+                continue;
+            }
+            let base = self.setup_base(t.ticker_id, now);
+            if setup_met(&th, base, t.volume, t.price) {
+                hits.push((t.clone(), base));
+            }
+        }
+        if hits.is_empty() {
+            return 0;
+        }
+        let clock = chrono::Local::now().format("%H:%M:%S").to_string();
+        let mut raised = 0;
+        for (t, base) in hits {
+            if self.raise(AlertKind::Setup, &t, base, now, &clock) {
+                raised += 1;
+            }
+        }
+        raised
+    }
+
+    /// How long an alert's Status label is held: the cooldown, but at least `BADGE_HOLD`.
+    fn badge_hold(&self) -> Duration {
+        self.th.alert_cooldown.max(BADGE_HOLD)
+    }
+
+    /// Whether the cooldown of `kind` for `sym` has run out.
+    fn can_fire(&self, sym: &str, kind: AlertKind, now: Instant) -> bool {
+        let last = self.fired.get(sym).and_then(|f| f[kind.slot()]);
+        last.is_none_or(|at| now.saturating_duration_since(at) >= self.th.alert_cooldown)
+    }
+
+    /// Logs an alert unless the symbol is blacklisted or still cooling down for this kind, and
+    /// starts the cooldown and the Status badge. `base` is the value one SETUP window ago.
+    fn raise(&mut self, kind: AlertKind, t: &Ticker, base: Option<(u64, f64)>, now: Instant, clock: &str) -> bool {
+        if self.blacklist.contains(&t.symbol) || !self.can_fire(&t.symbol, kind, now) {
+            return false;
+        }
+        self.fired.entry(t.symbol.clone()).or_default()[kind.slot()] = Some(now);
+        self.alerts.push_back(Alert {
+            at: now,
+            clock: clock.to_string(),
+            symbol: t.symbol.clone(),
+            kind,
+            prev_vol: base.map_or(-1, |b| b.0 as i64),
+            curr_vol: t.volume,
+            prev_price: base.map_or(-1.0, |b| b.1),
+            curr_price: t.price,
+            change_ratio: t.change_ratio,
+        });
+        while self.alerts.len() > self.th.max_alerts {
+            self.alerts.pop_front();
+        }
+        true
+    }
+
+    /// The alert label shown in the Status column: the highest-priority kind still held.
+    fn badge(&self, sym: &str, now: Instant) -> Option<AlertKind> {
+        let fired = self.fired.get(sym)?;
+        let hold = self.badge_hold();
+        BADGE_PRIORITY
+            .into_iter()
+            .find(|k| fired[k.slot()].is_some_and(|at| now.saturating_duration_since(at) < hold))
     }
 
     /// Mov: rank change on the full board ranked by % change, over `rank_interval`. Independent of
@@ -578,7 +666,8 @@ impl Engine {
             if self.blacklist.contains(&t.symbol) {
                 blacklisted.push(t.clone());
             } else if let Some(dim) = self.display_state(t, now) {
-                active.push(Ticker { dim, ..t.clone() });
+                let status = self.badge(&t.symbol, now).map_or_else(String::new, |k| k.label().to_string());
+                active.push(Ticker { dim, status, ..t.clone() });
             }
         }
         active.sort_by(|a, b| ordered(a, b, sort_key, sort_desc));
@@ -799,7 +888,8 @@ mod tests {
         // S: volume x5, flat price (a SPIKE before). P: price +50%, flat volume (a PUMP before).
         let out = e.process(rows(5000, 1.5), "symbol", false, t0 + Duration::from_secs(5));
         assert_eq!(out.new_alerts, 0);
-        assert!(out.active.iter().all(|t| t.status.is_empty()));
+        // only the sticky NEW badge from the first list is still shown
+        assert!(out.active.iter().all(|t| t.status == "NEW"));
         assert!(kinds(&e).iter().all(|k| *k == AlertKind::New));
         // the tick counter still follows the price move
         assert_eq!(e.tick_rates(t0 + Duration::from_secs(6))[3], (0, 1));
@@ -895,6 +985,161 @@ mod tests {
         let out = e.process(vec![rest], "change", true, t0 + Duration::from_secs(311));
         assert_eq!(out.active[0].status, "SETUP");
         assert_eq!(e.alerts().back().unwrap().prev_vol, 1000);
+    }
+
+    /// Status of the only row as the table would show it at `now`.
+    fn status_at(e: &Engine, now: Instant) -> String {
+        e.reapply("change", true, now).active[0].status.clone()
+    }
+
+    /// Lists row "A" (id 1) over REST at `t0`, then lets the stream bring it to exactly 2.2x and
+    /// +10% of 300 s ago; no REST fetch follows. Returns the time of that last quote, 310 s on.
+    fn stream_setup_hit(e: &mut Engine, t0: Instant) -> Instant {
+        setup_row(e, t0, 0, 1.0, 1000);
+        e.set_rest_feeds_series(false);
+        for (s, ms, seq, px, vol) in [(10, 10_000, 1, 1.0, 1000), (310, 310_000, 2, 1.10, 2200)] {
+            let mut u = upd(1, ms, seq, px, vol);
+            u.recv = t0 + Duration::from_secs(s);
+            e.apply_quotes(&[u], Session::Reg, t0 + Duration::from_secs(s));
+        }
+        t0 + Duration::from_secs(310)
+    }
+
+    #[test]
+    fn setup_is_raised_by_the_tick_once_per_cooldown() {
+        let mut e = setup_engine();
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        stream_setup_hit(&mut e, t0);
+        // the stream data alone raises nothing; the tick does
+        assert_eq!(kinds(&e), vec![AlertKind::New]);
+
+        assert_eq!(e.recompute(at(310)), 1);
+        assert_eq!(kinds(&e), vec![AlertKind::New, AlertKind::Setup]);
+        assert_eq!(status_at(&e, at(310)), "SETUP");
+        let a = e.alerts().back().unwrap();
+        assert_eq!((a.at, a.prev_vol, a.curr_vol), (at(310), 1000, 2200));
+
+        // the limits still hold on every following tick, but the cooldown keeps it to one alert
+        for s in (311..430).step_by(3) {
+            assert_eq!(e.recompute(at(s)), 0, "second {s}");
+        }
+        assert_eq!(e.recompute(at(429)), 0);
+        assert_eq!(kinds(&e).len(), 2);
+        // once the cooldown (120 s) is over and the condition still holds, it is raised again
+        assert_eq!(e.recompute(at(430)), 1);
+        assert_eq!(kinds(&e).len(), 3);
+    }
+
+    #[test]
+    fn setup_tick_skips_blacklisted_filtered_and_stale_rows() {
+        let t0 = Instant::now();
+        let mut e = setup_engine();
+        e.toggle_blacklist("A");
+        let now = stream_setup_hit(&mut e, t0);
+        assert_eq!(e.recompute(now), 0);
+
+        let mut e = setup_engine();
+        e.filters.min_price = 5.0;
+        let now = stream_setup_hit(&mut e, t0);
+        assert_eq!(e.recompute(now), 0);
+
+        let mut e = setup_engine();
+        let now = stream_setup_hit(&mut e, t0);
+        e.set_feed_stale(true);
+        assert_eq!(e.recompute(now), 0);
+        e.set_feed_stale(false);
+        assert_eq!(e.recompute(now), 1);
+    }
+
+    #[test]
+    fn cooldown_is_per_symbol_and_kind() {
+        let mut e = engine();
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let a = tk("A", 1.0, 1000, 0.1, 0.0);
+        let b = tk("B", 1.0, 1000, 0.1, 0.0);
+        assert!(e.raise(AlertKind::Setup, &a, None, at(0), "00:00:00"));
+        // same symbol and kind: held back for the whole cooldown
+        assert!(!e.raise(AlertKind::Setup, &a, None, at(1), "00:00:01"));
+        assert!(!e.raise(AlertKind::Setup, &a, None, at(119), "00:01:59"));
+        // another kind of the same symbol, and the same kind of another symbol, are independent
+        assert!(e.raise(AlertKind::New, &a, None, at(2), "00:00:02"));
+        assert!(e.raise(AlertKind::Setup, &b, None, at(3), "00:00:03"));
+        assert_eq!(e.alerts().len(), 3);
+        // the cooldown counts from the last raise
+        assert!(e.raise(AlertKind::Setup, &a, None, at(120), "00:02:00"));
+        assert!(!e.raise(AlertKind::Setup, &a, None, at(239), "00:03:59"));
+        assert!(e.raise(AlertKind::Setup, &a, None, at(240), "00:04:00"));
+    }
+
+    #[test]
+    fn cooldown_follows_the_configured_seconds() {
+        let mut e = engine();
+        e.apply_config(&Config { alert_cooldown_sec: 10, max_market_cap: 0.0, ..Config::default() });
+        let t0 = Instant::now();
+        let a = tk("A", 1.0, 1000, 0.1, 0.0);
+        assert!(e.raise(AlertKind::Setup, &a, None, t0, ""));
+        assert!(!e.raise(AlertKind::Setup, &a, None, t0 + Duration::from_secs(9), ""));
+        assert!(e.raise(AlertKind::Setup, &a, None, t0 + Duration::from_secs(10), ""));
+    }
+
+    #[test]
+    fn badge_is_held_for_the_cooldown() {
+        let mut e = setup_engine();
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        setup_row(&mut e, t0, 0, 1.0, 1000);
+        // NEW at 0 s, default cooldown 120 s: still shown until 120 s, gone at 120 s
+        assert_eq!(status_at(&e, at(0)), "NEW");
+        assert_eq!(status_at(&e, at(61)), "NEW");
+        assert_eq!(status_at(&e, at(119)), "NEW");
+        assert_eq!(status_at(&e, at(120)), "");
+        // the badge survives the table being rebuilt by a fetch that raises nothing
+        let out = setup_row(&mut e, t0, 100, 1.0, 1000);
+        assert_eq!(out.new_alerts, 0);
+        assert_eq!(out.active[0].status, "NEW");
+    }
+
+    #[test]
+    fn badge_is_held_at_least_60_s_when_the_cooldown_is_shorter() {
+        let mut e = engine();
+        e.apply_config(&Config { alert_cooldown_sec: 20, max_market_cap: 0.0, ..Config::default() });
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        e.process(vec![tk("A", 1.0, 1000, 0.1, 0.0)], "change", true, t0);
+        assert_eq!(status_at(&e, at(59)), "NEW");
+        assert_eq!(status_at(&e, at(60)), "");
+        // the cooldown itself is over long before the badge goes
+        assert!(e.can_fire("A", AlertKind::New, at(20)));
+    }
+
+    #[test]
+    fn badge_shows_the_highest_priority_kind_and_expiry_cleans_up() {
+        let mut e = engine();
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        e.process(vec![Ticker { ticker_id: 1, ..tk("A", 1.0, 1000, 0.1, 0.0) }], "change", true, t0);
+        let a = tk("A", 1.0, 1000, 0.1, 0.0);
+        assert!(e.raise(AlertKind::Setup, &a, None, at(30), ""));
+        assert_eq!(status_at(&e, at(31)), "SETUP");
+        // NEW (from 0 s) is covered by SETUP while both are held; SETUP outlasts it (30 s + 120 s)
+        e.recompute(at(121));
+        assert_eq!(status_at(&e, at(121)), "SETUP");
+        e.recompute(at(149));
+        assert_eq!(status_at(&e, at(149)), "SETUP");
+        e.recompute(at(150));
+        assert_eq!(status_at(&e, at(150)), "");
+        assert!(e.fired.is_empty());
+    }
+
+    #[test]
+    fn blacklisted_symbols_get_no_badge() {
+        let mut e = engine();
+        e.toggle_blacklist("A");
+        let a = tk("A", 1.0, 1000, 0.1, 0.0);
+        assert!(!e.raise(AlertKind::Setup, &a, None, Instant::now(), ""));
+        assert!(e.alerts().is_empty() && e.fired.is_empty());
     }
 
     #[test]

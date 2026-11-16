@@ -280,7 +280,10 @@ impl App {
     fn recompute(&mut self, now: Instant) {
         self.last_recompute = now;
         self.engine.refresh_vol_rates(now);
-        self.engine.recompute(now);
+        // Alerts raised here carry `now`, so the alerts table can flash the newest one.
+        if self.engine.recompute(now) > 0 {
+            self.last_alert_at = Some(now);
+        }
         self.reapply_local();
     }
 

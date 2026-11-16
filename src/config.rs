@@ -35,6 +35,8 @@ pub struct Config {
     pub setup_price_pct: f64,
     pub min_volume_for_alert: i64,
     pub min_price_for_alert: f64,
+    /// Seconds before the same alert kind can be raised again for one symbol.
+    pub alert_cooldown_sec: u64,
 
     // Display filters (0 = disabled)
     pub min_change_percent: f64,
@@ -71,6 +73,7 @@ impl Default for Config {
             setup_price_pct: 10.0,
             min_volume_for_alert: 10_000,
             min_price_for_alert: 1.0,
+            alert_cooldown_sec: 120,
             min_change_percent: 0.0,
             max_change_percent: 0.0,
             min_volume: 0,
@@ -152,6 +155,9 @@ impl Config {
         }
         if self.setup_window_sec == 0 {
             self.setup_window_sec = 300;
+        }
+        if self.alert_cooldown_sec == 0 {
+            self.alert_cooldown_sec = 120;
         }
         if self.vol_m_window_seconds == 0 {
             self.vol_m_window_seconds = 180;
@@ -304,6 +310,19 @@ mod tests {
         // an old file without the key gets the default
         let cfg: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(cfg.recompute_ms, 1000);
+    }
+
+    #[test]
+    fn alert_cooldown_defaults_to_120_and_zero_resets() {
+        assert_eq!(Config::default().alert_cooldown_sec, 120);
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.alert_cooldown_sec, 120);
+        let mut cfg = Config { alert_cooldown_sec: 0, ..Config::default() };
+        cfg.validate();
+        assert_eq!(cfg.alert_cooldown_sec, 120);
+        let mut cfg = Config { alert_cooldown_sec: 45, ..Config::default() };
+        cfg.validate();
+        assert_eq!(cfg.alert_cooldown_sec, 45);
     }
 
     #[test]
