@@ -4,12 +4,12 @@ Status as of 2026-11-16. Spec: `docs/plan.md` (user decisions, authoritative) an
 
 ## Done (committed)
 
-- [x] 1. Alert flash fix (`6bf7d66`)
-- [x] 2. No alerts for blacklisted symbols (`4d7628b`)
-- [x] 3. History and candles recorded before display filters (`245c94e`)
-- [x] 4. Mov sort fix + symbol tiebreak (`9bc46cf`)
-- [x] 5. Cursor follows selected symbol (`28885be`)
-- [x] 6. `s` / config save re-sort locally, no fetch (`dc71117`)
+- [x] 1. Alert flash fix (`0072564`)
+- [x] 2. No alerts for blacklisted symbols (`c3a2ee2`)
+- [x] 3. History and candles recorded before display filters (`bf67fb1`)
+- [x] 4. Mov sort fix + symbol tiebreak (`9908be1`)
+- [x] 5. Cursor follows selected symbol (`c915e4b`)
+- [x] 6. `s` / config save re-sort locally, no fetch (`d8e8a5e`)
 
 ## Unfinished: build steps in order
 
