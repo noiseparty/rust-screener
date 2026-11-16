@@ -11,10 +11,10 @@ Status as of 2026-11-16. Spec: `docs/plan.md` (user decisions, authoritative) an
 - [x] 5. Cursor follows selected symbol (`c915e4b`)
 - [x] 6. `s` / config save re-sort locally, no fetch (`d8e8a5e`)
 - [x] 7. App home dir (`5fc469a`)
+- [x] 8. Stream client (`0d056c3`)
 
 ## Unfinished: build steps in order
 
-- [ ] 8. **Stream client** (item 8): `src/stream.rs`, MQTT over WSS, protobuf decode, subscribe unfiltered gainers by tickerId, 250 ms batches, reconnect/backoff, REST list every 20 s, REST fallback poll when stream down, header `● WSS n subs m msg/s` / `● REST, stream down`, `stream_enabled` config.
 - [ ] 9. **Series store**: per-ticker receive-time series with ingest rules, `vol_at` / `px_at`, clear rules (session/date change, reconnect, source switch, 60 s linger).
 - [ ] 10. **Probe mode** (item 7): `volume_screener.exe --probe` headless recorder → `probe\probe-YYYY-MM-DD.csv`.
 - [ ] 11. **Vol/m column** (item 9): replaces Δ volume column.
