@@ -22,7 +22,7 @@ Status as of 2026-11-16. Spec: `docs/plan.md` (user decisions, authoritative) an
 
 ## Unfinished: build steps in order
 
-- [ ] 16. **Rate panel tabs** (item 16): `t` toggles New Highs/Lows (default) and Up/Down ticks; tab remembered in config.
+- [x] 16. Rate panel tabs (`1590e93`)
 - [ ] 17. **Settings consolidation** (item 20): Fallback Poll, SETUP fields, Alert Cooldown, Recompute (ms), Vol/m Window, named field lookups in preview.
 - [ ] 18. **Candle storage** (item 21 part B): append 1-minute candles to `data\candles-YYYY-MM-DD.csv`, reload today's on start, delete previous days on launch.
 - [ ] 19. **Final review + release**: check against plan, clippy, README, `cargo build --release`, copy exe to project root.
