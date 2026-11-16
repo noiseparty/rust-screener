@@ -4,14 +4,14 @@ mod chart;
 mod config;
 mod engine;
 mod health;
+mod paths;
 mod scraper;
 mod session;
 mod ui;
 
 use app::{App, Msg};
-use config::{Config, CONFIG_PATH};
+use config::Config;
 use crossterm::event::{self, Event, KeyEventKind};
-use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -20,10 +20,21 @@ const FRAME: Duration = Duration::from_millis(80);
 const PAGE_SIZE: usize = 100;
 
 fn main() {
-    let cfg = match Config::load(Path::new(CONFIG_PATH)) {
+    let paths = match paths::Paths::from_env().and_then(|p| {
+        let cwd = std::env::current_dir()?;
+        p.init(&cwd)?;
+        Ok(p)
+    }) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Error preparing app home: {e}");
+            std::process::exit(1);
+        }
+    };
+    let cfg = match Config::load(&paths.config) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Error loading {CONFIG_PATH}: {e}");
+            eprintln!("Error loading {}: {e}", paths.config.display());
             std::process::exit(1);
         }
     };
@@ -51,7 +62,7 @@ fn main() {
         }
     });
 
-    let mut app = App::new(cfg, fetch_tx, health_tx);
+    let mut app = App::new(cfg, paths.config.clone(), fetch_tx, health_tx);
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, &mut app, &msg_rx);
     ratatui::restore();

@@ -7,9 +7,22 @@ highlowtick-style TUI with ratatui.
 
 ```
 cargo build --release
-target\release\volume_screener.exe     # run from this folder; reads/writes ./config.json
+target\release\volume_screener.exe
 cargo test
 ```
+
+## App home
+
+Config and data live in `%LOCALAPPDATA%\VolumeScreener\`:
+
+```
+config.json   settings (contains the proxy key; never commit it)
+data\         saved data (candle storage comes in a later step)
+probe\        probe recordings
+```
+
+The folders are created on first run. If `config.json` exists in the current directory and not in the app home, it is
+moved there once. No installer is needed.
 
 `rust-toolchain.toml` pins the `stable` toolchain (needs 1.85+).
 

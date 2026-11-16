@@ -1,10 +1,10 @@
-use crate::config::{Config, CONFIG_PATH, FILTER_NAMES};
+use crate::config::{Config, FILTER_NAMES};
 use crate::engine::{AlertKind, Engine, Filters};
 use crate::health::CheckResult;
 use crate::scraper::{Fetched, Ticker};
 use crate::session::Session;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
@@ -86,6 +86,7 @@ pub enum Msg {
 
 pub struct App {
     pub cfg: Config,
+    pub config_path: PathBuf,
     pub engine: Engine,
     pub view: View,
     pub quit: bool,
@@ -132,12 +133,13 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cfg: Config, fetch_tx: Sender<()>, health_tx: Sender<()>) -> App {
+    pub fn new(cfg: Config, config_path: PathBuf, fetch_tx: Sender<()>, health_tx: Sender<()>) -> App {
         let now = Instant::now();
         App {
             engine: Engine::new(&cfg),
             inputs: inputs_from(&cfg),
             cfg,
+            config_path,
             view: View::Boot,
             quit: false,
             started_at: now,
@@ -282,7 +284,7 @@ impl App {
 
     fn save_config(&mut self) {
         self.cfg.blacklisted_tickers = self.engine.blacklist.iter().cloned().collect();
-        if let Err(e) = self.cfg.save(Path::new(CONFIG_PATH)) {
+        if let Err(e) = self.cfg.save(&self.config_path) {
             self.error = Some(format!("save config: {e}"));
         }
     }
@@ -658,7 +660,7 @@ mod tests {
     fn cursor_follows_selected_symbol_across_resort() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let (htx, _hrx) = std::sync::mpsc::channel();
-        let mut app = App::new(Config::default(), tx, htx);
+        let mut app = App::new(Config::default(), PathBuf::from("unused-test-config.json"), tx, htx);
         let mk = |s: &str| Ticker { symbol: s.into(), ..Default::default() };
         app.tickers = vec![mk("A"), mk("B"), mk("C")];
         app.move_row(1);

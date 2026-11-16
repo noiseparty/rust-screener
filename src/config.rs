@@ -4,7 +4,6 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-pub const CONFIG_PATH: &str = "config.json";
 pub const FILTER_NAMES: [&str; 5] = ["ALL", "NEW", "PUMP", "SPIKE", "SETUP"];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -132,7 +131,9 @@ mod tests {
     use super::*;
 
     fn tmp(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("vs_cfg_test_{}_{}.json", name, std::process::id()))
+        let d = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("test-config");
+        fs::create_dir_all(&d).unwrap();
+        d.join(format!("vs_cfg_test_{}_{}.json", name, std::process::id()))
     }
 
     #[test]
