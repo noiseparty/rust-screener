@@ -23,7 +23,7 @@ Status as of 2026-11-16. Spec: `docs/plan.md` (user decisions, authoritative) an
 ## Unfinished: build steps in order
 
 - [x] 16. Rate panel tabs (`1590e93`)
-- [ ] 17. **Settings consolidation** (item 20): Fallback Poll, SETUP fields, Alert Cooldown, Recompute (ms), Vol/m Window, named field lookups in preview.
+- [x] 17. Settings consolidation (`e33d1bc`)
 - [ ] 18. **Candle storage** (item 21 part B): append 1-minute candles to `data\candles-YYYY-MM-DD.csv`, reload today's on start, delete previous days on launch.
 - [ ] 19. **Final review + release**: check against plan, clippy, README, `cargo build --release`, copy exe to project root.
 
