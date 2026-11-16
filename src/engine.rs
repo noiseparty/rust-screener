@@ -258,9 +258,7 @@ impl Engine {
 
         for mut t in tickers {
             let is_bl = self.blacklist.contains(&t.symbol);
-            if !is_bl && !self.filters.matches(&t) {
-                continue;
-            }
+            let shown = is_bl || self.filters.matches(&t);
 
             let vh = self.vol_hist.entry(t.symbol.clone()).or_default();
             if let Some(base) = baseline(vh, now, th.delta_window) {
@@ -278,9 +276,9 @@ impl Engine {
             let kind = match self.last.get(&t.symbol) {
                 None => Some(AlertKind::New),
                 Some(prev) => {
-                    if t.price > prev.price {
+                    if shown && t.price > prev.price {
                         self.ticks.push_back((now, true));
-                    } else if t.price < prev.price {
+                    } else if shown && t.price < prev.price {
                         self.ticks.push_back((now, false));
                     }
                     let eligible = t.volume >= th.min_volume_for_alert && t.price >= th.min_price_for_alert;
@@ -297,7 +295,7 @@ impl Engine {
                 }
             };
 
-            if let Some(kind) = kind.filter(|_| !is_bl) {
+            if let Some(kind) = kind.filter(|_| shown && !is_bl) {
                 self.alerts.push_back(Alert {
                     at: now,
                     clock: clock.clone(),
@@ -315,7 +313,11 @@ impl Engine {
 
             self.record_sample(&t.symbol, epoch, t.price, t.volume);
             self.last.insert(t.symbol.clone(), t.clone());
-            if is_bl { blacklisted.push(t) } else { active.push(t) }
+            if is_bl {
+                blacklisted.push(t)
+            } else if shown {
+                active.push(t)
+            }
         }
 
         let horizon = Duration::from_secs(RATE_WINDOWS[0].1);
@@ -495,6 +497,21 @@ mod tests {
         assert!(e.alerts.is_empty());
         assert_eq!(out.blacklisted[0].symbol, "BL");
         assert!(e.last.contains_key("BL"));
+    }
+
+    #[test]
+    fn filtered_tickers_keep_history_but_hide_and_raise_no_alerts() {
+        let mut cfg = Config::default();
+        cfg.max_market_cap = 0.0;
+        cfg.min_price = 5.0;
+        let mut e = Engine::new(&cfg);
+        let out = e.process(vec![tk("F", 1.0, 1000, 0.1, 0.0)], "change", true, Instant::now());
+        assert!(out.active.is_empty());
+        assert_eq!(out.new_alerts, 0);
+        assert!(e.alerts.is_empty());
+        assert_eq!(e.vol_hist["F"].len(), 1);
+        assert_eq!(e.price_hist["F"].len(), 1);
+        assert!(e.candles("F").is_some());
     }
 
     #[test]
