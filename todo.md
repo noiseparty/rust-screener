@@ -1,6 +1,6 @@
 # TODO
 
-Status as of 2026-11-16. Spec: `docs/plan.md` (user decisions, authoritative) and `docs/stream-design.md`.
+Status as of 2026-11-17: all build steps done. Spec: `docs/plan.md` (user decisions, authoritative) and `docs/stream-design.md`. Handoff: `CONTINUE.md`.
 
 ## Done (committed)
 
@@ -19,27 +19,21 @@ Status as of 2026-11-16. Spec: `docs/plan.md` (user decisions, authoritative) an
 - [x] 13. SETUP (`e6dd601`)
 - [x] 14. Cooldown + sticky badge (`859037e`)
 - [x] 15. NEW rework (`91007d7`)
-
-## Unfinished: build steps in order
-
 - [x] 16. Rate panel tabs (`1590e93`)
 - [x] 17. Settings consolidation (`e33d1bc`)
 - [x] 18. Candle storage (`270b9f5`)
-- [ ] 19. **Final review + release**: check against plan, clippy, README, `cargo build --release`, copy exe to project root.
-
-## Resume
-
-Re-run the build workflow from step 7. Saved script:
-`C:\Users\Testweek2\.claude\projects\C--Users-Testweek2-Desktop-Web-TOOLS-volume-screener-rust\0665e736-f904-4931-96fb-f3e901274c41\workflows\scripts\stream-rework-build-wf_6ff531bb-2fc.js`
-(resume run `wf_6ff531bb-2fc` replays steps 1–6 from cache, same session only; in a new session, remove steps 1–6 from the script or let them no-op on the committed tree.)
+- [x] 19. Final review + release (`a6ac657`): plan check, README and CONTINUE.md updated, `cargo build --release` (0 warnings), 165 tests pass, exe copied to the project root. Clippy is not installed, so no clippy pass.
 
 ## User actions
 
-- [ ] Close the running `volume_screener.exe` before the release step; the copy in the project root is the original pre-UI build and is locked while running.
-- [ ] After step 10: run `volume_screener.exe --probe` one day from before 11:00 to after 23:00 Riga time, then share the CSV so stream behaviour at session changes can be checked (extended-hours price, volume/high/low resets, status codes, subscription cap).
+- [ ] Run `volume_screener.exe --probe` one day from before 11:00 to after 23:00 Riga time, then share the CSV so stream behaviour at session changes can be checked (extended-hours price, volume/high/low resets, status codes, subscription cap).
+- [ ] After the probe data: check `MAX_SUBS = 100` against the probe (200 subscriptions were accepted), the step-9 older-session drop rule, and the regular-hours price field (`close`).
+- [ ] Run the TUI once and look at it: nothing in the final build has been seen on screen (header indicator, Vol/m, Mov, dimming, rate tabs, Settings, candle files in `%LOCALAPPDATA%\VolumeScreener\data\`).
+- [ ] Decide whether the public repo keeps the Webull stream details in `docs/`, or becomes private. Nothing is pushed yet.
 
 ## Open questions / later
 
 - Revisit rate-based SPIKE and robust PUMP (design 2.2 / 2.3) if the user wants them back; currently hidden.
 - Historical candle backfill from a Webull chart endpoint (unverified) so charts cover time before the app started.
 - Stream is an unofficial Webull API; REST fallback must stay working.
+- Clippy pass once the component is installed (needs the user's approval: `rustup component add clippy` writes outside the project).
