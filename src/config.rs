@@ -16,6 +16,8 @@ pub struct Config {
     pub min_market_cap: f64,
     pub max_market_cap: f64,
     pub rank_tracking_interval_seconds: u64,
+    /// Re-rank / re-sort tick in milliseconds: 500 or 1000.
+    pub recompute_ms: u64,
 
     // SPIKE / PUMP alert thresholds
     pub spike_vol_ratio: f64,
@@ -53,6 +55,7 @@ impl Default for Config {
             min_market_cap: 0.0,
             max_market_cap: 1e15,
             rank_tracking_interval_seconds: 60,
+            recompute_ms: 1000,
             spike_vol_ratio: 2.0,
             pump_price_pct: 0.05,
             baseline_window_sec: 300,
@@ -104,6 +107,11 @@ impl Config {
         }
         if self.rank_tracking_interval_seconds == 0 {
             self.rank_tracking_interval_seconds = 60;
+        } else if self.rank_tracking_interval_seconds < 5 {
+            self.rank_tracking_interval_seconds = 5;
+        }
+        if self.recompute_ms != 500 {
+            self.recompute_ms = 1000;
         }
         if self.spike_vol_ratio <= 0.0 {
             self.spike_vol_ratio = 2.0;
@@ -195,6 +203,26 @@ mod tests {
         let mut cfg = Config { vol_m_window_seconds: 5, ..Config::default() };
         cfg.validate();
         assert_eq!(cfg.vol_m_window_seconds, 30);
+    }
+
+    #[test]
+    fn recompute_ms_accepts_only_500_or_1000() {
+        assert_eq!(Config::default().recompute_ms, 1000);
+        for (given, want) in [(500, 500), (1000, 1000), (0, 1000), (250, 1000), (750, 1000), (60_000, 1000)] {
+            let mut cfg = Config { recompute_ms: given, ..Config::default() };
+            cfg.validate();
+            assert_eq!(cfg.recompute_ms, want, "given {given}");
+        }
+        // an old file without the key gets the default
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.recompute_ms, 1000);
+    }
+
+    #[test]
+    fn rank_interval_has_a_minimum_of_5() {
+        let mut cfg = Config { rank_tracking_interval_seconds: 2, ..Config::default() };
+        cfg.validate();
+        assert_eq!(cfg.rank_tracking_interval_seconds, 5);
     }
 
     #[test]

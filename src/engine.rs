@@ -1,10 +1,10 @@
 use crate::config::Config;
-use crate::scraper::Ticker;
+use crate::scraper::{Mov, Ticker};
 use crate::series::{Ingest, Obs, SeriesStore, Source};
 use crate::session::Session;
 use crate::stream::Update;
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 pub const MAX_ROWS: usize = 100;
@@ -17,6 +17,8 @@ pub const MAX_SUBS: usize = 100;
 pub const MIN_VOL_M_WINDOW_SECS: u64 = 30;
 /// Series history kept beyond the longest window a consumer looks back over.
 const SERIES_MARGIN: Duration = Duration::from_secs(60);
+/// A row that stops passing a display filter stays visible, dimmed, this long.
+pub const FILTER_GRACE: Duration = Duration::from_secs(60);
 pub const RATE_WINDOWS: [(&str, u64); 4] = [("20m", 1200), ("5m", 300), ("1m", 60), ("30s", 30)];
 
 /// One-minute OHLCV bar built from observed price/volume samples.
@@ -181,7 +183,13 @@ pub struct Engine {
     latest: Vec<Ticker>,
     vol_hist: HashMap<String, Vec<(Instant, i64)>>,
     price_hist: HashMap<String, Vec<(Instant, f64)>>,
-    rank_hist: HashMap<String, HashMap<String, Vec<(Instant, usize)>>>,
+    /// Full-board order by % change (every listed symbol, blacklisted included), pushed
+    /// whenever it changes; the entry in force at `now - rank_interval` is the Mov baseline.
+    rank_ring: VecDeque<(Instant, Vec<String>)>,
+    /// Symbols that passed the display filters at the last recompute.
+    passing: HashSet<String>,
+    /// Symbols that stopped passing, and when. Visible (dimmed) for `FILTER_GRACE`, then hidden.
+    failing_since: HashMap<String, Instant>,
     alerts: VecDeque<Alert>,
     /// Price tick direction events across the board: (time, is_up).
     ticks: VecDeque<(Instant, bool)>,
@@ -207,7 +215,9 @@ impl Engine {
             latest: Vec::new(),
             vol_hist: HashMap::new(),
             price_hist: HashMap::new(),
-            rank_hist: HashMap::new(),
+            rank_ring: VecDeque::new(),
+            passing: HashSet::new(),
+            failing_since: HashMap::new(),
             alerts: VecDeque::new(),
             ticks: VecDeque::new(),
             candles: HashMap::new(),
@@ -358,6 +368,14 @@ impl Engine {
         while self.alerts.len() > self.th.max_alerts {
             self.alerts.pop_front();
         }
+        // New filters apply at once: nothing lingers from the old ones.
+        self.failing_since.clear();
+        self.passing = self.latest.iter().filter(|t| self.shown(t)).map(|t| t.symbol.clone()).collect();
+    }
+
+    /// Passes the display filters now (blacklisted rows are listed separately, never here).
+    fn shown(&self, t: &Ticker) -> bool {
+        !self.blacklist.contains(&t.symbol) && self.filters.matches(t)
     }
 
     pub fn alerts(&self) -> &VecDeque<Alert> {
@@ -389,8 +407,6 @@ impl Engine {
         let clock = wall.format("%H:%M:%S").to_string();
         let epoch = wall.timestamp();
         let th = self.th;
-        let mut active = Vec::with_capacity(tickers.len());
-        let mut blacklisted = Vec::new();
         let mut new_alerts = 0;
         let mut latest = Vec::with_capacity(tickers.len());
 
@@ -469,12 +485,7 @@ impl Engine {
 
             self.record_sample(&t.symbol, epoch, t.price, t.volume);
             self.last.insert(t.symbol.clone(), t.clone());
-            latest.push(t.clone());
-            if is_bl {
-                blacklisted.push(t)
-            } else if shown {
-                active.push(t)
-            }
+            latest.push(t);
         }
 
         let horizon = Duration::from_secs(RATE_WINDOWS[0].1);
@@ -482,74 +493,133 @@ impl Engine {
             self.ticks.pop_front();
         }
 
-        // rank_change is derived from rank order, so Mov cannot be ranked by itself:
-        // rank by change, then reorder by the computed movement.
-        let (rank_key, rank_desc) = if sort_key == "mov" { ("change", true) } else { (sort_key, sort_desc) };
-        active.sort_by(|a, b| ordered(a, b, rank_key, rank_desc));
-        active.truncate(MAX_ROWS);
-
-        self.track_ranks(&mut active, rank_key, rank_desc, now);
-        if sort_key == "mov" {
-            active.sort_by(|a, b| ordered(a, b, sort_key, sort_desc));
-        }
-
         while self.alerts.len() > th.max_alerts {
             self.alerts.pop_front();
         }
 
-        let ranks: HashMap<&str, i32> = active.iter().map(|t| (t.symbol.as_str(), t.rank_change)).collect();
-        for t in latest.iter_mut() {
-            if let Some(&r) = ranks.get(t.symbol.as_str()) {
-                t.rank_change = r;
-            }
-        }
         self.index = latest.iter().enumerate().filter(|(_, t)| t.ticker_id != 0).map(|(i, t)| (t.ticker_id, i)).collect();
         self.live.retain(|id, _| self.index.contains_key(id));
         self.latest = latest;
 
-        Output { active, blacklisted, new_alerts }
+        // A fetch is rare and changes membership: rank and filter at once instead of at the next tick.
+        self.recompute(now);
+        let mut out = self.reapply(sort_key, sort_desc, now);
+        out.new_alerts = new_alerts;
+        out
     }
 
-    /// Re-filter and re-sort the last processed tickers with the current filters,
-    /// blacklist and sort. Records no history, ticks, alerts or rank samples.
-    pub fn reapply(&self, sort_key: &str, sort_desc: bool) -> Output {
+    /// The recompute tick: re-ranks the full board (Mov) and moves rows into or out of the
+    /// filter grace. Stream quotes only change data; the display follows on this tick.
+    pub fn recompute(&mut self, now: Instant) {
+        self.rank_board(now);
+        self.update_display(now);
+    }
+
+    /// Mov: rank change on the full board ranked by % change, over `rank_interval`. Independent of
+    /// the user's sort and filters; blacklisted symbols are left out of both boards.
+    fn rank_board(&mut self, now: Instant) {
+        if self.latest.is_empty() {
+            return;
+        }
+        let mut board: Vec<&Ticker> = self.latest.iter().collect();
+        board.sort_by(|a, b| board_order(a, b));
+        let order: Vec<String> = board.iter().map(|t| t.symbol.clone()).collect();
+
+        // Baseline: the board in force `rank_interval` ago, if we have been running that long.
+        let cutoff = now.checked_sub(self.th.rank_interval);
+        let old = cutoff.and_then(|c| self.rank_ring.iter().rev().find(|(at, _)| *at <= c)).map(|(_, o)| o.as_slice());
+        let movs = movements(old, &order, &self.blacklist);
+        for t in &mut self.latest {
+            t.mov = movs.get(t.symbol.as_str()).copied().unwrap_or_default();
+        }
+
+        if self.rank_ring.back().is_none_or(|(_, last)| *last != order) {
+            self.rank_ring.push_back((now, order));
+        }
+        // Keep exactly one entry at or before the cutoff: it is the baseline.
+        if let Some(c) = cutoff {
+            while self.rank_ring.get(1).is_some_and(|(at, _)| *at <= c) {
+                self.rank_ring.pop_front();
+            }
+        }
+    }
+
+    /// Tracks which symbols pass the display filters; a symbol that stops passing starts its grace.
+    fn update_display(&mut self, now: Instant) {
+        let mut passing = HashSet::new();
+        let mut failing = HashMap::new();
+        for t in &self.latest {
+            if self.blacklist.contains(&t.symbol) {
+                continue;
+            }
+            if self.filters.matches(t) {
+                passing.insert(t.symbol.clone());
+            } else if let Some(&since) = self.failing_since.get(&t.symbol) {
+                failing.insert(t.symbol.clone(), since);
+            } else if self.passing.contains(&t.symbol) {
+                failing.insert(t.symbol.clone(), now);
+            }
+        }
+        self.passing = passing;
+        self.failing_since = failing;
+    }
+
+    /// Whether a row is on the board at `now`, and if so whether it is dimmed (filter grace).
+    fn display_state(&self, t: &Ticker, now: Instant) -> Option<bool> {
+        if self.filters.matches(t) {
+            return Some(false);
+        }
+        match self.failing_since.get(&t.symbol) {
+            Some(&since) => (now.saturating_duration_since(since) < FILTER_GRACE).then_some(true),
+            // Failing since a moment ago; the next recompute starts its grace.
+            None => self.passing.contains(&t.symbol).then_some(true),
+        }
+    }
+
+    /// Re-filter and re-sort the last processed tickers with the current filters, blacklist and
+    /// sort. Records no history, ticks, alerts or rank samples and leaves Mov as last computed.
+    pub fn reapply(&self, sort_key: &str, sort_desc: bool, now: Instant) -> Output {
         let mut active = Vec::new();
         let mut blacklisted = Vec::new();
         for t in &self.latest {
             if self.blacklist.contains(&t.symbol) {
                 blacklisted.push(t.clone());
-            } else if self.filters.matches(t) {
-                active.push(t.clone());
+            } else if let Some(dim) = self.display_state(t, now) {
+                active.push(Ticker { dim, ..t.clone() });
             }
         }
-        let rank_key = if sort_key == "mov" { "change" } else { sort_key };
-        let rank_desc = sort_key == "mov" || sort_desc;
-        active.sort_by(|a, b| ordered(a, b, rank_key, rank_desc));
+        active.sort_by(|a, b| ordered(a, b, sort_key, sort_desc));
         active.truncate(MAX_ROWS);
-        if sort_key == "mov" {
-            active.sort_by(|a, b| ordered(a, b, sort_key, sort_desc));
-        }
         Output { active, blacklisted, new_alerts: 0 }
     }
+}
 
-    fn track_ranks(&mut self, active: &mut [Ticker], sort_key: &str, sort_desc: bool, now: Instant) {
-        let interval = self.th.rank_interval;
-        let ctx = self.rank_hist.entry(format!("{sort_key}_{sort_desc}")).or_default();
-        for (i, t) in active.iter_mut().enumerate() {
-            let rank = i + 1;
-            let hist = ctx.entry(t.symbol.clone()).or_default();
-            let last = hist.last().map(|&(_, r)| r);
-            hist.retain(|&(at, _)| now.saturating_duration_since(at) < interval * 2);
-            let base = hist
-                .iter()
-                .find(|&&(at, _)| now.saturating_duration_since(at) <= interval)
-                .map(|&(_, r)| r)
-                .or(last);
-            t.rank_change = base.map_or(0, |b| b as i32 - rank as i32);
-            hist.push((now, rank));
-        }
-        ctx.retain(|_, h| h.last().is_some_and(|&(at, _)| now.saturating_duration_since(at) < Duration::from_secs(300)));
-    }
+/// Full-board order: % change, then volume (both descending), then symbol.
+fn board_order(a: &Ticker, b: &Ticker) -> Ordering {
+    b.change_ratio
+        .partial_cmp(&a.change_ratio)
+        .unwrap_or(Ordering::Equal)
+        .then(b.volume.cmp(&a.volume))
+        .then_with(|| a.symbol.cmp(&b.symbol))
+}
+
+/// Rank movement of every symbol of `new` against `old` (both best first), blacklisted symbols
+/// removed from both. No `old` board gives blanks; a symbol missing from it is a new entrant.
+fn movements<'a>(old: Option<&[String]>, new: &'a [String], blacklist: &BTreeSet<String>) -> HashMap<&'a str, Mov> {
+    let old_rank: Option<HashMap<&str, i32>> = old.map(|o| {
+        o.iter().filter(|s| !blacklist.contains(*s)).enumerate().map(|(i, s)| (s.as_str(), i as i32 + 1)).collect()
+    });
+    new.iter()
+        .filter(|s| !blacklist.contains(*s))
+        .enumerate()
+        .map(|(i, s)| {
+            let mov = match &old_rank {
+                None => Mov::None,
+                Some(r) => r.get(s.as_str()).map_or(Mov::New, |&was| Mov::Moved(was - (i as i32 + 1))),
+            };
+            (s.as_str(), mov)
+        })
+        .collect()
 }
 
 /// Series history to keep: the longest look-back window plus a margin.
@@ -600,15 +670,27 @@ fn prune<T>(hist: &mut Vec<(Instant, T)>, now: Instant, window: Duration) {
     hist.drain(..keep_from);
 }
 
-/// Sort order for `key`. Rows without a Vol/m rate go last in both directions.
+/// Places gained on the board; `None` for blank and new-entrant rows.
+fn mov_places(t: &Ticker) -> Option<i32> {
+    match t.mov {
+        Mov::Moved(n) => Some(n),
+        Mov::None | Mov::New => None,
+    }
+}
+
+/// Sort order for `key`. Rows without a Vol/m rate, or without a Mov rank change (blank or a
+/// new entrant), go last in both directions.
 fn ordered(a: &Ticker, b: &Ticker, key: &str, desc: bool) -> Ordering {
-    if key == "volrate" {
-        match (a.vol_rate, b.vol_rate) {
-            (None, Some(_)) => return Ordering::Greater,
-            (Some(_), None) => return Ordering::Less,
-            (None, None) => return a.symbol.cmp(&b.symbol),
-            _ => {}
-        }
+    let blanks = match key {
+        "volrate" => Some((a.vol_rate.is_some(), b.vol_rate.is_some())),
+        "mov" => Some((mov_places(a).is_some(), mov_places(b).is_some())),
+        _ => None,
+    };
+    match blanks {
+        Some((false, true)) => return Ordering::Greater,
+        Some((true, false)) => return Ordering::Less,
+        Some((false, false)) => return a.symbol.cmp(&b.symbol),
+        _ => {}
     }
     let o = compare(a, b, key);
     if desc { o.reverse() } else { o }
@@ -617,7 +699,7 @@ fn ordered(a: &Ticker, b: &Ticker, key: &str, desc: bool) -> Ordering {
 pub fn compare(a: &Ticker, b: &Ticker, key: &str) -> Ordering {
     let f = |x: f64, y: f64| x.partial_cmp(&y).unwrap_or(Ordering::Equal);
     let primary = match key {
-        "mov" => a.rank_change.cmp(&b.rank_change),
+        "mov" => mov_places(a).unwrap_or(0).cmp(&mov_places(b).unwrap_or(0)),
         "symbol" => a.symbol.cmp(&b.symbol),
         "price" => f(a.price, b.price),
         "change" => f(a.change_ratio, b.change_ratio),
@@ -704,7 +786,7 @@ mod tests {
     }
 
     fn row(e: &Engine) -> Ticker {
-        e.reapply("change", true).active.remove(0)
+        e.reapply("change", true, Instant::now()).active.remove(0)
     }
 
     #[test]
@@ -897,10 +979,10 @@ mod tests {
         e.process(vec![tk("A", 1.0, 1000, 0.1, 0.0), tk("B", 9.0, 1000, 0.2, 0.0)], "change", true, t0);
         let alerts = e.alerts.len();
         let samples = e.vol_hist["A"].len();
-        let out = e.reapply("price", true);
+        let out = e.reapply("price", true, Instant::now());
         assert_eq!(out.active[0].symbol, "B");
-        e.filters.min_price = 5.0;
-        let out = e.reapply("price", true);
+        e.apply_config(&Config { min_price: 5.0, max_market_cap: 0.0, ..Config::default() });
+        let out = e.reapply("price", true, Instant::now());
         assert_eq!(out.active.len(), 1);
         assert_eq!(out.active[0].symbol, "B");
         assert_eq!(e.alerts.len(), alerts);
@@ -916,15 +998,228 @@ mod tests {
         }
     }
 
+    fn rank_tk(sym: &str, id: u64, chg: f64) -> Ticker {
+        Ticker { ticker_id: id, prev_close: 1.0, ..tk(sym, 1.0 + chg, 1000, chg, 0.0) }
+    }
+
+    fn movs(out: &Output) -> Vec<(String, Mov)> {
+        let mut v: Vec<_> = out.active.iter().map(|t| (t.symbol.clone(), t.mov)).collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
+    }
+
+    fn mv(s: &str, m: Mov) -> (String, Mov) {
+        (s.to_string(), m)
+    }
+
     #[test]
-    fn rank_change_tracks_movement() {
+    fn mov_is_rank_change_over_the_interval() {
         let mut e = engine();
         let t0 = Instant::now();
-        e.process(vec![tk("A", 1.0, 1, 0.5, 0.0), tk("B", 1.0, 1, 0.3, 0.0)], "change", true, t0);
-        let out = e.process(vec![tk("A", 1.0, 1, 0.2, 0.0), tk("B", 1.0, 1, 0.4, 0.0)], "change", true, t0 + Duration::from_secs(5));
+        let board = |a: f64, b: f64, c: f64| vec![tk("A", 1.0, 1, a, 0.0), tk("B", 1.0, 1, b, 0.0), tk("C", 1.0, 1, c, 0.0)];
+        // no history yet: blank
+        let out = e.process(board(0.5, 0.3, 0.1), "change", true, t0);
+        assert!(out.active.iter().all(|t| t.mov == Mov::None));
+        // 59 s in: the baseline is not a full interval old
+        let out = e.process(board(0.2, 0.4, 0.1), "change", true, t0 + Duration::from_secs(59));
+        assert!(out.active.iter().all(|t| t.mov == Mov::None));
+        // 60 s in: ranks A1 B2 C3 became B1 A2 C3
+        let out = e.process(board(0.2, 0.4, 0.1), "change", true, t0 + Duration::from_secs(60));
+        assert_eq!(movs(&out), [mv("A", Mov::Moved(-1)), mv("B", Mov::Moved(1)), mv("C", Mov::Moved(0))]);
         assert_eq!(out.active[0].symbol, "B");
-        assert_eq!(out.active[0].rank_change, 1);
-        assert_eq!(out.active[1].rank_change, -1);
+    }
+
+    #[test]
+    fn mov_baseline_is_the_board_one_interval_ago() {
+        let mut e = engine();
+        let t0 = Instant::now();
+        let at = |s| t0 + Duration::from_secs(s);
+        let board = |a: f64, b: f64| vec![tk("A", 1.0, 1, a, 0.0), tk("B", 1.0, 1, b, 0.0)];
+        e.process(board(0.5, 0.3), "change", true, at(0)); // A B
+        e.process(board(0.3, 0.5), "change", true, at(30)); // B A
+        e.process(board(0.5, 0.3), "change", true, at(55)); // A B again
+        // baseline for t=70 is the board at t=10: A B. Nothing moved, whatever happened in between.
+        let out = e.process(board(0.5, 0.3), "change", true, at(70));
+        assert_eq!(movs(&out), [mv("A", Mov::Moved(0)), mv("B", Mov::Moved(0))]);
+        // baseline for t=95 is the board at t=35: B A
+        let out = e.process(board(0.5, 0.3), "change", true, at(95));
+        assert_eq!(movs(&out), [mv("A", Mov::Moved(1)), mv("B", Mov::Moved(-1))]);
+    }
+
+    #[test]
+    fn mov_marks_new_entrants_and_ignores_the_blacklist() {
+        let mut e = engine();
+        let t0 = Instant::now();
+        e.process(vec![tk("A", 1.0, 1, 0.3, 0.0), tk("B", 1.0, 1, 0.2, 0.0)], "change", true, t0);
+        // D enters on top; blacklisted X sits above A and B but is not ranked at all
+        e.blacklist.insert("X".into());
+        let out = e.process(
+            vec![tk("D", 1.0, 1, 0.9, 0.0), tk("X", 1.0, 1, 0.8, 0.0), tk("A", 1.0, 1, 0.3, 0.0), tk("B", 1.0, 1, 0.2, 0.0)],
+            "change",
+            true,
+            t0 + Duration::from_secs(60),
+        );
+        // A and B each drop one place behind D; X has no Mov
+        assert_eq!(movs(&out), [mv("A", Mov::Moved(-1)), mv("B", Mov::Moved(-1)), mv("D", Mov::New)]);
+        assert_eq!(out.blacklisted[0].mov, Mov::None);
+        // X was not on the board at the start of the interval, so un-blacklisted it counts as a new entrant
+        e.blacklist.clear();
+        e.recompute(t0 + Duration::from_secs(61));
+        let out = e.reapply("change", true, t0 + Duration::from_secs(61));
+        assert!(out.active.iter().any(|t| t.symbol == "X" && t.mov == Mov::New));
+    }
+
+    #[test]
+    fn mov_ignores_sort_and_display_filters() {
+        let mut e = engine();
+        let t0 = Instant::now();
+        let board = |a: f64, b: f64, c: f64| vec![tk("A", 5.0, 1, a, 0.0), tk("B", 1.0, 1, b, 0.0), tk("C", 3.0, 1, c, 0.0)];
+        e.process(board(0.5, 0.3, 0.1), "change", true, t0);
+        let t1 = t0 + Duration::from_secs(60);
+        let by_change = e.process(board(0.1, 0.3, 0.5), "change", true, t1);
+        let by_price = e.reapply("price", false, t1);
+        assert_eq!(movs(&by_change), movs(&by_price));
+        assert_eq!(movs(&by_change), [mv("A", Mov::Moved(-2)), mv("B", Mov::Moved(0)), mv("C", Mov::Moved(2))]);
+        // a filter that hides B and C leaves the full-board ranks untouched
+        let cfg = Config { min_price: 4.0, max_market_cap: 0.0, ..Config::default() };
+        e.apply_config(&cfg);
+        let out = e.reapply("change", true, t1);
+        assert_eq!(out.active.len(), 1);
+        assert_eq!(out.active[0].mov, Mov::Moved(-2));
+    }
+
+    #[test]
+    fn sorting_by_mov_puts_blank_and_new_rows_last() {
+        let mut e = engine();
+        let t0 = Instant::now();
+        e.process(vec![tk("A", 1.0, 1, 0.5, 0.0), tk("B", 1.0, 1, 0.3, 0.0), tk("C", 1.0, 1, 0.1, 0.0)], "change", true, t0);
+        let t1 = t0 + Duration::from_secs(60);
+        // new board B C N A: A lost 3, B and C gained 1, N is new
+        let out = e.process(
+            vec![tk("A", 1.0, 1, 0.1, 0.0), tk("B", 1.0, 1, 0.5, 0.0), tk("C", 1.0, 1, 0.3, 0.0), tk("N", 1.0, 1, 0.2, 0.0)],
+            "mov",
+            true,
+            t1,
+        );
+        let order = |o: &Output| o.active.iter().map(|t| t.symbol.as_str()).collect::<String>();
+        assert_eq!(order(&out), "CBAN");
+        assert_eq!(order(&e.reapply("mov", false, t1)), "ABCN");
+        // before any history every row is blank: symbol order
+        let mut fresh = engine();
+        let out = fresh.process(vec![tk("B", 1.0, 1, 0.3, 0.0), tk("A", 1.0, 1, 0.5, 0.0)], "mov", true, t0);
+        assert_eq!(order(&out), "AB");
+    }
+
+    #[test]
+    fn recompute_tick_reranks_from_stream_quotes() {
+        let mut e = engine();
+        let t0 = Instant::now();
+        e.process(vec![rank_tk("A", 1, 0.5), rank_tk("B", 2, 0.3)], "change", true, t0);
+        // stream data arrives; Mov is not recomputed until the tick
+        assert!(e.apply_quotes(&[upd(1, 1000, 1, 1.1, 2000), upd(2, 1000, 1, 1.9, 2000)], Session::Reg, t0));
+        let t1 = t0 + Duration::from_secs(60);
+        let out = e.reapply("change", true, t1);
+        assert!(out.active.iter().all(|t| t.mov == Mov::None));
+        assert_eq!(out.active[0].symbol, "B");
+        e.recompute(t1);
+        let out = e.reapply("change", true, t1);
+        assert_eq!(movs(&out), [mv("A", Mov::Moved(-1)), mv("B", Mov::Moved(1))]);
+    }
+
+    fn filtered_engine(min_price: f64) -> Engine {
+        let mut cfg = Config::default();
+        cfg.max_market_cap = 0.0;
+        cfg.min_price = min_price;
+        Engine::new(&cfg)
+    }
+
+    fn rows_dim(e: &Engine, now: Instant) -> Vec<(String, bool)> {
+        e.reapply("symbol", false, now).active.iter().map(|t| (t.symbol.clone(), t.dim)).collect()
+    }
+
+    fn row_dim(s: &str, dim: bool) -> (String, bool) {
+        (s.to_string(), dim)
+    }
+
+    #[test]
+    fn row_failing_a_filter_stays_dimmed_for_60s_then_hides() {
+        let mut e = filtered_engine(2.0);
+        let t0 = Instant::now();
+        let at = |s| t0 + Duration::from_secs(s);
+        let a = |price: f64| tk("A", price, 1000, 0.1, 0.0);
+        let out = e.process(vec![a(3.0), tk("B", 5.0, 1, 0.1, 0.0)], "symbol", false, t0);
+        assert_eq!(out.active.iter().map(|t| t.dim).collect::<Vec<_>>(), [false, false]);
+        // A drops under the price filter: still listed, dimmed
+        e.process(vec![a(1.5), tk("B", 5.0, 1, 0.1, 0.0)], "symbol", false, at(10));
+        assert_eq!(rows_dim(&e, at(10)), [row_dim("A", true), row_dim("B", false)]);
+        // the grace runs from the recompute that noticed it (t=10)
+        e.recompute(at(30));
+        assert_eq!(rows_dim(&e, at(69)), [row_dim("A", true), row_dim("B", false)]);
+        assert_eq!(rows_dim(&e, at(70)), [row_dim("B", false)]);
+        e.recompute(at(80));
+        assert_eq!(rows_dim(&e, at(80)), [row_dim("B", false)]);
+        // once hidden it stays hidden while it keeps failing
+        e.recompute(at(200));
+        assert_eq!(rows_dim(&e, at(200)), [row_dim("B", false)]);
+    }
+
+    #[test]
+    fn row_that_passes_again_during_grace_is_undimmed_and_regraces_later() {
+        let mut e = filtered_engine(2.0);
+        let t0 = Instant::now();
+        let at = |s| t0 + Duration::from_secs(s);
+        let a = |price: f64| vec![tk("A", price, 1000, 0.1, 0.0)];
+        e.process(a(3.0), "symbol", false, t0);
+        e.process(a(1.0), "symbol", false, at(10));
+        assert_eq!(rows_dim(&e, at(40)), [row_dim("A", true)]);
+        e.process(a(3.0), "symbol", false, at(40));
+        assert_eq!(rows_dim(&e, at(41)), [row_dim("A", false)]);
+        // fails again: a fresh 60 s starts, not the remainder of the old one
+        e.process(a(1.0), "symbol", false, at(50));
+        assert_eq!(rows_dim(&e, at(109)), [row_dim("A", true)]);
+        assert_eq!(rows_dim(&e, at(110)), []);
+    }
+
+    #[test]
+    fn row_that_never_passed_is_not_shown_and_leaving_rows_are_forgotten() {
+        let mut e = filtered_engine(2.0);
+        let t0 = Instant::now();
+        e.process(vec![tk("A", 1.0, 1, 0.1, 0.0)], "symbol", false, t0);
+        assert_eq!(rows_dim(&e, t0), []);
+        e.process(vec![tk("B", 3.0, 1, 0.1, 0.0)], "symbol", false, t0 + Duration::from_secs(1));
+        assert!(e.passing.contains("B") && !e.passing.contains("A"));
+        e.process(vec![], "symbol", false, t0 + Duration::from_secs(2));
+        assert!(e.passing.is_empty() && e.failing_since.is_empty());
+    }
+
+    #[test]
+    fn saving_config_clears_the_grace() {
+        let mut e = filtered_engine(2.0);
+        let t0 = Instant::now();
+        e.process(vec![tk("A", 3.0, 1, 0.1, 0.0)], "symbol", false, t0);
+        let tight = Config { min_price: 4.0, max_market_cap: 0.0, ..Config::default() };
+        // the filters changed under the engine: A would be in grace
+        e.filters = Filters::from_config(&tight);
+        assert_eq!(rows_dim(&e, t0), [row_dim("A", true)]);
+        // saving applies the new filters at once
+        e.apply_config(&tight);
+        assert_eq!(rows_dim(&e, t0), []);
+        // and loosening brings the row back undimmed
+        let loose = Config { min_price: 1.0, max_market_cap: 0.0, ..Config::default() };
+        e.apply_config(&loose);
+        assert_eq!(rows_dim(&e, t0), [row_dim("A", false)]);
+    }
+
+    #[test]
+    fn blacklisted_rows_are_never_in_grace() {
+        let mut e = filtered_engine(0.0);
+        let t0 = Instant::now();
+        e.process(vec![tk("A", 3.0, 1, 0.1, 0.0)], "symbol", false, t0);
+        e.toggle_blacklist("A");
+        e.recompute(t0 + Duration::from_secs(1));
+        let out = e.reapply("symbol", false, t0 + Duration::from_secs(1));
+        assert!(out.active.is_empty());
+        assert_eq!(out.blacklisted.len(), 1);
     }
 
     #[test]
@@ -988,7 +1283,7 @@ mod tests {
     fn quotes_update_rows_and_change_is_local() {
         let (mut e, t0) = live_engine();
         assert!(e.apply_quotes(&[upd(7, 1000, 1, 1.5, 1600)], Session::Reg, t0));
-        let t = &e.reapply("change", true).active[0];
+        let t = &e.reapply("change", true, Instant::now()).active[0];
         assert_eq!((t.price, t.volume), (1.5, 1600));
         assert!((t.change_ratio - 0.5).abs() < 1e-9);
         // 5 s of history is too little for Vol/m
@@ -1011,9 +1306,9 @@ mod tests {
         // lower volume: dropped twice, believed on the third reading
         assert!(!e.apply_quotes(&[upd(7, 1100, 1, 1.6, 50)], Session::Reg, t0));
         assert!(!e.apply_quotes(&[upd(7, 1200, 1, 1.6, 50)], Session::Reg, t0));
-        assert_eq!(e.reapply("change", true).active[0].volume, 2100);
+        assert_eq!(e.reapply("change", true, Instant::now()).active[0].volume, 2100);
         assert!(e.apply_quotes(&[upd(7, 1300, 1, 1.6, 50)], Session::Reg, t0));
-        assert_eq!(e.reapply("change", true).active[0].volume, 50);
+        assert_eq!(e.reapply("change", true, Instant::now()).active[0].volume, 50);
     }
 
     #[test]
@@ -1022,10 +1317,10 @@ mod tests {
         let mut u = upd(7, 1000, 1, 1.5, 1100);
         u.p_price = Some(1.8);
         e.apply_quotes(&[u.clone()], Session::Pre, t0);
-        assert_eq!(e.reapply("change", true).active[0].price, 1.8);
+        assert_eq!(e.reapply("change", true, Instant::now()).active[0].price, 1.8);
         u.trade_ms = base_ms() + 2000;
         e.apply_quotes(&[u], Session::Reg, t0);
-        assert_eq!(e.reapply("change", true).active[0].price, 1.5);
+        assert_eq!(e.reapply("change", true, Instant::now()).active[0].price, 1.5);
     }
 
     #[test]

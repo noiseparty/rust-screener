@@ -22,8 +22,23 @@ pub struct Ticker {
     pub vol_partial: bool,
     /// The feed is silent, so `vol_rate` is not shown.
     pub vol_stale: bool,
-    pub rank_change: i32,
+    /// Rank movement on the full board; set by the engine's recompute tick.
+    pub mov: Mov,
+    /// Row no longer passes a display filter and is on its way out (dimmed).
+    pub dim: bool,
     pub status: String,
+}
+
+/// Rank change of a ticker on the full gainers board over the tracking interval.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Mov {
+    /// No history yet: shown blank.
+    #[default]
+    None,
+    /// Not on the board at the start of the interval: shown as a cyan `+`.
+    New,
+    /// Places gained (positive) or lost (negative).
+    Moved(i32),
 }
 
 pub struct Fetched {

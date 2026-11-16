@@ -1,9 +1,9 @@
 use crate::app::{App, View, BL_COLS, BOOT_ITEMS, COLUMNS, FIELDS, SETUP_ITEMS};
 use crate::config::FILTER_NAMES;
 use crate::engine::{AlertKind, RATE_WINDOWS};
-use crate::scraper::Ticker;
+use crate::scraper::{Mov, Ticker};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::Frame;
@@ -305,7 +305,7 @@ fn ticker_tape(f: &mut Frame, app: &App, area: Rect) {
     let mut cells: Vec<(char, Style)> = Vec::new();
     let push = |cells: &mut Vec<(char, Style)>, s: &str, st: Style| cells.extend(s.chars().map(|c| (c, st)));
     for t in app.tickers.iter().take(30) {
-        let (arrow, color) = if t.rank_change < 0 { ("▼", RED) } else { ("▲", GREEN) };
+        let (arrow, color) = if t.change_ratio < 0.0 { ("▼", RED) } else { ("▲", GREEN) };
         push(&mut cells, "   ", Style::new());
         match status_kind(&t.status) {
             Some(k) => push(&mut cells, &format!(" {} ", t.symbol), kind_style(k)),
@@ -375,10 +375,12 @@ fn fit_columns(app: &mut App, width: u16) {
 
 fn cell(t: &Ticker, key: &str) -> Cell<'static> {
     match key {
-        "mov" => match t.rank_change {
-            0 => Cell::from(Span::styled("  ·", Style::new().fg(FAINT))),
-            r if r > 0 => Cell::from(Span::styled(format!("▲{r}"), Style::new().fg(GREEN))),
-            r => Cell::from(Span::styled(format!("▼{}", -r), Style::new().fg(RED))),
+        "mov" => match t.mov {
+            Mov::None => Cell::from(""),
+            Mov::New => Cell::from(Span::styled("+", Style::new().fg(CYAN).bold())),
+            Mov::Moved(0) => Cell::from(Span::styled("  ·", Style::new().fg(FAINT))),
+            Mov::Moved(r) if r > 0 => Cell::from(Span::styled(format!("▲{r}"), Style::new().fg(GREEN))),
+            Mov::Moved(r) => Cell::from(Span::styled(format!("▼{}", -r), Style::new().fg(RED))),
         },
         "symbol" => Cell::from(Span::styled(t.symbol.clone(), Style::new().bold())),
         "price" => Cell::from(Line::from(format!("{:.2}", t.price)).alignment(Alignment::Right)),
@@ -437,7 +439,15 @@ fn gainers_table(f: &mut Frame, app: &mut App, area: Rect) {
 
     let rows = app.tickers.iter().enumerate().map(|(i, t)| {
         let row = Row::new(app.visible_cols.iter().map(|&ci| cell(t, COLUMNS[ci].key)));
-        if i % 2 == 1 { row.style(Style::new().bg(ZEBRA)) } else { row }
+        let mut style = Style::new();
+        if i % 2 == 1 {
+            style = style.bg(ZEBRA);
+        }
+        // Filter grace: the row no longer passes a display filter and will vanish soon.
+        if t.dim {
+            style = style.fg(FAINT).add_modifier(Modifier::DIM);
+        }
+        row.style(style)
     });
 
     let widths: Vec<Constraint> = app.visible_cols.iter().map(|&ci| Constraint::Length(COLUMNS[ci].width)).collect();

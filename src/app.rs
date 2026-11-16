@@ -84,8 +84,6 @@ pub enum View {
 pub const LIST_REFRESH: u64 = 20;
 /// No stream message or status for this long means the stream is down.
 const STREAM_STALE: Duration = Duration::from_secs(15);
-/// Vol/m is recomputed this often, so a quiet ticker decays between messages.
-const VOL_REFRESH: Duration = Duration::from_secs(1);
 
 pub enum Msg {
     Fetched(Result<Fetched, String>),
@@ -109,7 +107,8 @@ pub struct App {
     stream_status_at: Option<Instant>,
     last_fetch: Option<Instant>,
     last_ok_fetch: Option<Instant>,
-    last_vol_refresh: Instant,
+    /// Last recompute tick (re-rank, filter grace, Vol/m, re-sort).
+    last_recompute: Instant,
     fetching: bool,
     running: bool,
     pub next_refresh: Instant,
@@ -172,7 +171,7 @@ impl App {
             stream_status_at: None,
             last_fetch: None,
             last_ok_fetch: None,
-            last_vol_refresh: now,
+            last_recompute: now,
             fetching: false,
             running: false,
             next_refresh: now,
@@ -258,10 +257,8 @@ impl App {
         self.engine.set_rest_feeds_series(!self.stream_ok());
         let stale = self.feed_stale(now);
         self.engine.set_feed_stale(stale);
-        if now.saturating_duration_since(self.last_vol_refresh) >= VOL_REFRESH {
-            self.last_vol_refresh = now;
-            self.engine.refresh_vol_rates(now);
-            self.reapply_local();
+        if now.saturating_duration_since(self.last_recompute) >= self.recompute_interval() {
+            self.recompute(now);
         }
         if self.engine.expire_series(now) {
             self.send_subscriptions();
@@ -272,6 +269,19 @@ impl App {
         if self.running && !self.fetching && now >= self.next_refresh {
             self.request_fetch();
         }
+    }
+
+    fn recompute_interval(&self) -> Duration {
+        Duration::from_millis(self.cfg.recompute_ms)
+    }
+
+    /// The recompute tick: Vol/m, Mov and filter grace are refreshed and the table re-sorted.
+    /// Stream batches only update data; the display follows here.
+    fn recompute(&mut self, now: Instant) {
+        self.last_recompute = now;
+        self.engine.refresh_vol_rates(now);
+        self.engine.recompute(now);
+        self.reapply_local();
     }
 
     fn request_fetch(&mut self) {
@@ -297,6 +307,8 @@ impl App {
                         let out = self.engine.process(f.tickers, self.sort_key, self.sort_desc, now);
                         self.tickers = out.active;
                         self.blacklisted = out.blacklisted;
+                        // process() re-ranked the board, so this counts as a recompute tick.
+                        self.last_recompute = now;
                         self.send_subscriptions();
                         if out.new_alerts > 0 {
                             self.last_alert_at = Some(now);
@@ -307,8 +319,8 @@ impl App {
                 }
             }
             Msg::Quotes(updates) => {
+                // Data only: the table is re-ranked and re-sorted on the recompute tick.
                 if self.engine.apply_quotes(&updates, Session::now(), Instant::now()) {
-                    self.reapply_local();
                     self.last_update = Some(chrono::Local::now().format("%H:%M:%S").to_string());
                 }
             }
@@ -594,7 +606,7 @@ impl App {
 
     /// Re-filter and re-sort the last fetched data without a network fetch.
     fn reapply_local(&mut self) {
-        let out = self.engine.reapply(self.sort_key, self.sort_desc);
+        let out = self.engine.reapply(self.sort_key, self.sort_desc, Instant::now());
         self.tickers = out.active;
         self.blacklisted = out.blacklisted;
         self.resync_row();
@@ -768,5 +780,49 @@ mod tests {
         app.resync_row();
         assert_eq!(app.row, 1);
         assert_eq!(app.sel_symbol.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn stream_batches_wait_for_the_recompute_tick() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (htx, _hrx) = std::sync::mpsc::channel();
+        let cfg = Config { recompute_ms: 500, max_market_cap: 0.0, ..Config::default() };
+        let mut app = App::new(cfg, PathBuf::from("unused-test-config.json"), tx, htx, None);
+        let row = |s: &str, id: u64, chg: f64| Ticker {
+            ticker_id: id,
+            symbol: s.into(),
+            price: 1.0 + chg,
+            prev_close: 1.0,
+            volume: 1000,
+            change_ratio: chg,
+            ..Default::default()
+        };
+        let base = app.last_recompute;
+        let out = app.engine.process(vec![row("A", 1, 0.10), row("B", 2, 0.05)], "change", true, base);
+        app.tickers = out.active;
+        assert_eq!(app.tickers[0].symbol, "A");
+        // B jumps past A on the stream: the data changes, the table does not
+        let quote = stream::Update {
+            id: 2,
+            trade_ms: chrono::Utc::now().timestamp_millis(),
+            seq: 1,
+            close: Some(2.0),
+            p_price: None,
+            change_ratio: None,
+            volume: Some(2000),
+            mcap: None,
+            high: None,
+            low: None,
+            status: String::new(),
+            recv: Instant::now(),
+        };
+        app.on_msg(Msg::Quotes(vec![quote]));
+        assert_eq!(app.tickers[0].symbol, "A");
+        app.on_tick(base + Duration::from_millis(400));
+        assert_eq!(app.tickers[0].symbol, "A");
+        // the tick (500 ms here) re-sorts
+        app.on_tick(base + Duration::from_millis(500));
+        assert_eq!(app.tickers[0].symbol, "B");
+        assert_eq!(app.last_recompute, base + Duration::from_millis(500));
     }
 }
