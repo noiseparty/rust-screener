@@ -207,11 +207,12 @@ impl App {
                         self.all = f.tickers.clone();
                         self.group = f.group;
                         self.session = f.session;
-                        let out = self.engine.process(f.tickers, self.sort_key, self.sort_desc, Instant::now());
+                        let now = Instant::now();
+                        let out = self.engine.process(f.tickers, self.sort_key, self.sort_desc, now);
                         self.tickers = out.active;
                         self.blacklisted = out.blacklisted;
                         if out.new_alerts > 0 {
-                            self.last_alert_at = Some(Instant::now());
+                            self.last_alert_at = Some(now);
                         }
                         self.row = self.row.min(self.tickers.len().saturating_sub(1));
                         self.last_update = Some(chrono::Local::now().format("%H:%M:%S").to_string());
