@@ -1,5 +1,5 @@
 use crate::app::{App, View, BL_COLS, BOOT_ITEMS, COLUMNS, FIELDS, SETUP_ITEMS};
-use crate::config::FILTER_NAMES;
+use crate::config::{RateTab, FILTER_NAMES};
 use crate::engine::{AlertKind, RATE_WINDOWS};
 use crate::scraper::{Mov, Ticker};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -328,23 +328,45 @@ fn ticker_tape(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn rate_bars(f: &mut Frame, app: &App, area: Rect) {
-    let rates = app.engine.tick_rates(Instant::now());
-    let max = rates.iter().flat_map(|&(d, u)| [d, u]).max().unwrap_or(0).max(1);
+    let now = Instant::now();
+    let tab = app.cfg.rate_tab;
+    // (left = down side, right = up side) counts per window
+    let (rates, left_name, right_name) = match tab {
+        RateTab::Ticks => (app.engine.tick_rates(now), "Downticks", "Upticks"),
+        RateTab::HighsLows => {
+            let hl = app.engine.high_low_counts(now);
+            (hl.map(|(h, l)| (l, h)), "New lows", "New highs")
+        }
+    };
+    // New highs/lows: bars are events per second, scaled to the largest of all rows and both
+    // sides, so short windows show acceleration. Ticks keep their raw-count scale.
+    let per_sec = |v: u32, i: usize| match tab {
+        RateTab::HighsLows => v as f64 / RATE_WINDOWS[i].1 as f64,
+        RateTab::Ticks => v as f64,
+    };
+    let max = rates.iter().enumerate().flat_map(|(i, &(d, u))| [per_sec(d, i), per_sec(u, i)]).fold(0.0, f64::max);
     // count(4) sp bar sp label(3) sp bar sp count(4)
     let bar_w = (area.width.saturating_sub(16) / 2).clamp(4, 36) as usize;
-    let bar = |v: u32| {
-        let filled = ((v as f64 / max as f64) * bar_w as f64).round() as usize;
-        (filled.min(bar_w), bar_w - filled.min(bar_w))
+    let bar = |v: u32, i: usize| {
+        let frac = if max > 0.0 { per_sec(v, i) / max } else { 0.0 };
+        let filled = ((frac * bar_w as f64).round() as usize).min(bar_w);
+        (filled, bar_w - filled)
     };
 
-    let mut lines = vec![Line::from(vec![
-        Span::styled(format!("{:>w$}", "Downticks", w = bar_w + 5), Style::new().fg(DIM)),
-        Span::styled("  ·  ", Style::new().fg(FAINT)),
-        Span::styled(format!("{:<w$}", "Upticks", w = bar_w + 5), Style::new().fg(DIM)),
-    ])];
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(tab.title(), Style::new().fg(TEXT).bold()),
+            Span::styled("   t switch", Style::new().fg(FAINT)),
+        ]),
+        Line::from(vec![
+            Span::styled(format!("{left_name:>w$}", w = bar_w + 5), Style::new().fg(DIM)),
+            Span::styled("  ·  ", Style::new().fg(FAINT)),
+            Span::styled(format!("{right_name:<w$}", w = bar_w + 5), Style::new().fg(DIM)),
+        ]),
+    ];
     for (i, &(down, up)) in rates.iter().enumerate() {
-        let (df, de) = bar(down);
-        let (uf, ue) = bar(up);
+        let (df, de) = bar(down, i);
+        let (uf, ue) = bar(up, i);
         lines.push(Line::from(vec![
             Span::styled(format!("{down:>4} "), Style::new().fg(DIM)),
             Span::styled("░".repeat(de), Style::new().fg(Color::Rgb(60, 24, 24))),
@@ -540,7 +562,7 @@ fn blacklist_box(f: &mut Frame, app: &App, area: Rect) {
 
 fn footer_bar(f: &mut Frame, app: &App, area: Rect) {
     let mut spans = Vec::new();
-    for (k, l) in [("enter", "chart"), ("←→", "column"), ("s", "sort"), ("f", "alerts"), ("v", "columns"), ("r", "refresh"), ("o", "setup"), ("q", "quit")] {
+    for (k, l) in [("enter", "chart"), ("←→", "column"), ("s", "sort"), ("f", "alerts"), ("t", "rates"), ("v", "columns"), ("r", "refresh"), ("o", "setup"), ("q", "quit")] {
         spans.extend(keyhint(k, l));
     }
     let interval = app.poll_interval();

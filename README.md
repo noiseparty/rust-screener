@@ -56,7 +56,7 @@ codes).
 ```
 header   VOLUME SCREENER  session · webull group   alert filter        ● live hh:mm:ss
 tape     scrolling top-30 gainers (alerted symbols highlighted)
-rates    Downticks | Upticks counts over 20m / 5m / 1m / 30s
+rates    New Highs/Lows (default) or Downticks | Upticks over 20m / 5m / 1m / 30s; `t` switches, remembered in config
 main     Top gainers table (zebra, sortable)   |  Alerts feed (+ blacklisted box)
 footer   key hints                                          next Ns ━━━━ refresh gauge
 ```

@@ -192,6 +192,92 @@ struct Live {
     at: Instant,
 }
 
+/// After (re)seeding, a ticker raises no new-high/low event for this long.
+const HL_ARM: Duration = Duration::from_secs(60);
+/// Least time between two events of one ticker.
+const HL_GAP: Duration = Duration::from_secs(1);
+
+/// Session high and low seen for one ticker.
+#[derive(Debug, Clone, Copy)]
+struct Extremes {
+    hi: f64,
+    lo: f64,
+    armed_at: Instant,
+    last_event: Option<Instant>,
+}
+
+/// Session new-high / new-low events across the board (design 2.8). A ticker's first quote of a
+/// session (or after a series clear) only sets its high and low; a new extreme after the arming
+/// delay is one event, at most one per second per ticker.
+#[derive(Debug, Default)]
+struct HighLow {
+    session: Option<Session>,
+    resets: u64,
+    map: HashMap<u64, Extremes>,
+    /// (time, is_high), oldest first. Kept across session changes so the windows decay by themselves.
+    events: VecDeque<(Instant, bool)>,
+}
+
+impl HighLow {
+    /// Starts over when the session changed or the series store was cleared since the last
+    /// quote: every ticker seeds again. Events stay and decay out of the windows.
+    fn sync(&mut self, session: Session, resets: u64) {
+        if self.session != Some(session) || self.resets != resets {
+            self.map.clear();
+            self.session = Some(session);
+            self.resets = resets;
+        }
+    }
+
+    /// `day_hi`/`day_lo`: the stream's day high/low, given only in the regular session.
+    fn quote(&mut self, id: u64, px: f64, day_hi: Option<f64>, day_lo: Option<f64>, now: Instant) {
+        if !(px > 0.0) {
+            return;
+        }
+        let h = day_hi.map_or(px, |d| px.max(d));
+        let l = day_lo.map_or(px, |d| px.min(d));
+        let Some(e) = self.map.get_mut(&id) else {
+            self.map.insert(id, Extremes { hi: h, lo: l, armed_at: now + HL_ARM, last_event: None });
+            return;
+        };
+        let is_high = if h > e.hi {
+            e.hi = h;
+            true
+        } else if l < e.lo {
+            e.lo = l;
+            false
+        } else {
+            return;
+        };
+        if now >= e.armed_at && e.last_event.is_none_or(|t| now.saturating_duration_since(t) >= HL_GAP) {
+            e.last_event = Some(now);
+            self.events.push_back((now, is_high));
+            self.prune(now);
+        }
+    }
+
+    /// Drops events the longest window no longer counts.
+    fn prune(&mut self, now: Instant) {
+        let horizon = Duration::from_secs(RATE_WINDOWS[0].1);
+        while self.events.front().is_some_and(|(at, _)| now.saturating_duration_since(*at) >= horizon) {
+            self.events.pop_front();
+        }
+    }
+
+    /// (highs, lows) per window, ordered as RATE_WINDOWS. An event exactly as old as the window is out.
+    fn counts(&self, now: Instant) -> [(u32, u32); 4] {
+        let mut out = [(0u32, 0u32); 4];
+        for (i, &(_, secs)) in RATE_WINDOWS.iter().enumerate() {
+            let w = Duration::from_secs(secs);
+            let start = self.events.partition_point(|(at, _)| now.saturating_duration_since(*at) >= w);
+            for &(_, is_high) in self.events.range(start..) {
+                if is_high { out[i].0 += 1 } else { out[i].1 += 1 }
+            }
+        }
+        out
+    }
+}
+
 pub struct Engine {
     pub filters: Filters,
     pub th: Thresholds,
@@ -217,6 +303,8 @@ pub struct Engine {
     fired: HashMap<String, [Option<Instant>; 4]>,
     /// Price tick direction events across the board: (time, is_up).
     ticks: VecDeque<(Instant, bool)>,
+    /// New-high / new-low tracking (design 2.8), fed by stream quotes only.
+    hl: HighLow,
     candles: HashMap<String, VecDeque<Candle>>,
     last_cum_vol: HashMap<String, i64>,
     live: HashMap<u64, Live>,
@@ -245,6 +333,7 @@ impl Engine {
             reseed: true,
             fired: HashMap::new(),
             ticks: VecDeque::new(),
+            hl: HighLow::default(),
             candles: HashMap::new(),
             last_cum_vol: HashMap::new(),
             live: HashMap::new(),
@@ -317,10 +406,16 @@ impl Engine {
             let ext = matches!(session, Session::Pre | Session::After);
             let px = if ext { u.p_price.filter(|p| *p > 0.0).or(u.close) } else { u.close };
             // A message without price or volume is dropped, never read as zero.
-            let (Some(px), Some(vol)) = (px.filter(|p| *p > 0.0), u.volume) else { continue };
+            let Some(px) = px.filter(|p| *p > 0.0) else { continue };
             // The series store owns ordering, lower-volume and session/date rules.
-            let obs = Obs { id: u.id, src: Source::Stream, ms: u.trade_ms, seq: u.seq, px: Some(px), vol: Some(vol), at: u.recv };
-            match self.series.ingest(obs) {
+            let ingest = u.volume.map(|vol| {
+                let obs = Obs { id: u.id, src: Source::Stream, ms: u.trade_ms, seq: u.seq, px: Some(px), vol: Some(vol), at: u.recv };
+                self.series.ingest(obs)
+            });
+            // New highs/lows read every quote, in whatever order it arrives (no trdSeq guard).
+            self.track_high_low(u, px, session, now);
+            let (Some(vol), Some(ingest)) = (u.volume, ingest) else { continue };
+            match ingest {
                 Ingest::Dropped => continue,
                 Ingest::Unchanged => {
                     // Nothing new, but the stream is alive for this ticker.
@@ -441,6 +536,27 @@ impl Engine {
         }
     }
 
+    /// One stream quote into the new-high/new-low tracker. Blacklisted and unlisted tickers are
+    /// ignored; a session change or a series clear (`resets()`) restarts the per-ticker extremes.
+    fn track_high_low(&mut self, u: &Update, px: f64, session: Session, now: Instant) {
+        if session == Session::Closed {
+            return;
+        }
+        let Some(&i) = self.index.get(&u.id) else { return };
+        if self.blacklist.contains(&self.latest[i].symbol) {
+            return;
+        }
+        self.hl.sync(session, self.series.resets());
+        // The stream's day high/low only mean something in the regular session.
+        let reg = |v: Option<f64>| v.filter(|v| session == Session::Reg && *v > 0.0);
+        self.hl.quote(u.id, px, reg(u.high), reg(u.low), now);
+    }
+
+    /// New highs / new lows per rate window as (highs, lows), ordered as RATE_WINDOWS.
+    pub fn high_low_counts(&self, now: Instant) -> [(u32, u32); 4] {
+        self.hl.counts(now)
+    }
+
     /// Down/up tick counts per rate window, ordered as RATE_WINDOWS.
     pub fn tick_rates(&self, now: Instant) -> [(u32, u32); 4] {
         let mut out = [(0u32, 0u32); 4];
@@ -530,6 +646,7 @@ impl Engine {
     /// `fetched`: the list was just replaced by a fetch (the first one after a reseed seeds NEW).
     fn recompute_at(&mut self, now: Instant, fetched: bool) -> usize {
         self.rank_board(now);
+        self.hl.prune(now);
         self.update_display(now);
         let raised = self.evaluate_new(now, fetched) + self.evaluate_setups(now);
         let hold = self.badge_hold();
@@ -2111,6 +2228,159 @@ mod tests {
         let ids = e.subscribe_ids();
         assert_eq!(ids.len(), MAX_SUBS);
         assert_eq!(ids[..90], (1..=90u64).collect::<Vec<_>>()[..]);
+    }
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    #[test]
+    fn high_low_first_quote_seeds_and_arms_after_60s() {
+        let mut h = HighLow::default();
+        let t0 = Instant::now();
+        h.quote(1, 1.0, None, None, t0);
+        // new extremes inside the arming delay move the levels but raise nothing
+        h.quote(1, 1.1, None, None, t0 + secs(30));
+        h.quote(1, 0.8, None, None, t0 + secs(59));
+        assert_eq!(h.counts(t0 + secs(59)), [(0, 0); 4]);
+        // armed: above the old high of 1.1 is a new high, below 0.8 a new low
+        h.quote(1, 1.2, None, None, t0 + secs(60));
+        h.quote(1, 0.7, None, None, t0 + secs(62));
+        // inside the range: nothing
+        h.quote(1, 1.0, None, None, t0 + secs(64));
+        assert_eq!(h.counts(t0 + secs(65)), [(1, 1); 4]);
+    }
+
+    #[test]
+    fn high_low_one_event_per_second_per_ticker_but_the_level_still_moves() {
+        let mut h = HighLow::default();
+        let t0 = Instant::now();
+        h.quote(1, 1.0, None, None, t0);
+        let t = t0 + secs(100);
+        h.quote(1, 1.1, None, None, t);
+        h.quote(1, 1.2, None, Some(0.9), t + Duration::from_millis(500)); // throttled
+        assert_eq!(h.counts(t + secs(1)), [(1, 0); 4]);
+        // 1.2 was absorbed: 1.2 again is no new high, 1.3 is (1 s after the last event)
+        h.quote(1, 1.2, None, None, t + secs(2));
+        h.quote(1, 1.3, None, None, t + secs(2));
+        assert_eq!(h.counts(t + secs(3)), [(2, 0); 4]);
+        // another ticker is not throttled by the first
+        h.quote(2, 5.0, None, None, t0);
+        h.quote(2, 5.5, None, None, t + secs(1));
+        assert_eq!(h.counts(t + secs(3)), [(3, 0); 4]);
+    }
+
+    #[test]
+    fn high_low_day_high_and_low_count_in_the_regular_session() {
+        let mut h = HighLow::default();
+        let t0 = Instant::now();
+        // seeds from the day range, not only the price
+        h.quote(1, 1.2, Some(1.5), Some(1.0), t0);
+        h.quote(1, 1.4, Some(1.5), Some(1.0), t0 + secs(100));
+        assert_eq!(h.counts(t0 + secs(100)), [(0, 0); 4]);
+        // the day high moves: that is a new high even though the price is below it
+        h.quote(1, 1.4, Some(1.6), Some(1.0), t0 + secs(101));
+        // the day low moves
+        h.quote(1, 1.4, Some(1.6), Some(0.95), t0 + secs(103));
+        assert_eq!(h.counts(t0 + secs(104)), [(1, 1); 4]);
+    }
+
+    #[test]
+    fn high_low_windows_exclude_age_equal_to_the_window() {
+        let mut h = HighLow::default();
+        let t0 = Instant::now();
+        h.quote(1, 1.0, None, None, t0);
+        let t = t0 + secs(100);
+        h.quote(1, 1.1, None, None, t); // high
+        h.quote(1, 0.9, None, None, t + secs(2)); // low
+        h.quote(1, 1.2, None, None, t + secs(4)); // high
+        // order is 20m, 5m, 1m, 30s
+        assert_eq!(h.counts(t + secs(29)), [(2, 1); 4]);
+        // the first high is exactly 30 s old: out of the 30 s window only
+        assert_eq!(h.counts(t + secs(30)), [(2, 1), (2, 1), (2, 1), (1, 1)]);
+        assert_eq!(h.counts(t + secs(32)), [(2, 1), (2, 1), (2, 1), (1, 0)]);
+        assert_eq!(h.counts(t + secs(62)), [(2, 1), (2, 1), (1, 0), (0, 0)]);
+        assert_eq!(h.counts(t + secs(300)), [(2, 1), (1, 1), (0, 0), (0, 0)]);
+        assert_eq!(h.counts(t + secs(1202)), [(1, 0), (0, 0), (0, 0), (0, 0)]);
+        assert_eq!(h.counts(t + secs(1204)), [(0, 0); 4]);
+        h.prune(t + secs(1204));
+        assert!(h.events.is_empty());
+    }
+
+    #[test]
+    fn high_low_session_change_or_series_clear_reseeds_but_keeps_events() {
+        let mut h = HighLow::default();
+        let t0 = Instant::now();
+        h.sync(Session::Pre, 0);
+        h.quote(1, 1.0, None, None, t0);
+        h.quote(1, 1.1, None, None, t0 + secs(100));
+        assert_eq!(h.counts(t0 + secs(100))[0], (1, 0));
+        // regular session opens: the old levels are gone, a lower price is only a new seed
+        h.sync(Session::Reg, 0);
+        h.quote(1, 0.5, None, None, t0 + secs(110));
+        h.quote(1, 0.4, None, None, t0 + secs(120)); // not armed yet
+        assert_eq!(h.counts(t0 + secs(120))[0], (1, 0)); // the earlier event is still counted
+        // a series clear does the same
+        h.quote(1, 0.3, None, None, t0 + secs(200)); // armed: new low
+        assert_eq!(h.counts(t0 + secs(200))[0], (1, 1));
+        h.sync(Session::Reg, 1);
+        h.quote(1, 0.2, None, None, t0 + secs(210)); // reseeded, not armed
+        assert_eq!(h.counts(t0 + secs(210))[0], (1, 1));
+    }
+
+    fn hl_engine() -> (Engine, Instant) {
+        let (mut e, t0) = live_engine(); // ticker id 7, symbol "A"
+        // seeds the tracker
+        e.apply_quotes(&[upd(7, 1000, 1, 1.0, 1000)], Session::Reg, t0);
+        (e, t0)
+    }
+
+    #[test]
+    fn engine_counts_new_highs_from_stream_quotes() {
+        let (mut e, t0) = hl_engine();
+        let t = t0 + secs(70);
+        e.apply_quotes(&[upd(7, 2000, 2, 1.2, 2000)], Session::Reg, t);
+        assert_eq!(e.high_low_counts(t)[3], (1, 0));
+        // a day low from the stream counts as a new low
+        let mut u = upd(7, 3000, 3, 1.2, 3000);
+        u.low = Some(0.7);
+        e.apply_quotes(&[u], Session::Reg, t + secs(2));
+        assert_eq!(e.high_low_counts(t + secs(2))[3], (1, 1));
+    }
+
+    #[test]
+    fn engine_ignores_blacklisted_unlisted_and_closed() {
+        let (mut e, t0) = hl_engine();
+        let t = t0 + secs(70);
+        // closed session: no tracking at all
+        e.apply_quotes(&[upd(7, 2000, 2, 1.2, 2000)], Session::Closed, t);
+        // an id that is not on the list
+        e.apply_quotes(&[upd(99, 2000, 2, 1.2, 2000)], Session::Reg, t);
+        assert_eq!(e.high_low_counts(t), [(0, 0); 4]);
+        e.toggle_blacklist("A");
+        e.apply_quotes(&[upd(7, 3000, 3, 1.3, 3000)], Session::Reg, t + secs(2));
+        assert_eq!(e.high_low_counts(t + secs(2)), [(0, 0); 4]);
+    }
+
+    #[test]
+    fn engine_restarts_on_session_change_and_stream_reconnect() {
+        let (mut e, t0) = hl_engine();
+        let t = t0 + secs(70);
+        e.apply_quotes(&[upd(7, 2000, 2, 1.2, 2000)], Session::Reg, t);
+        assert_eq!(e.high_low_counts(t)[3], (1, 0));
+        // new session: this quote only seeds, the event already counted stays
+        e.apply_quotes(&[upd(7, 3000, 3, 1.5, 3000)], Session::After, t + secs(5));
+        assert_eq!(e.high_low_counts(t + secs(5))[3], (1, 0));
+        // reconnect clears the series store: the next quote seeds again
+        e.on_stream_reconnect();
+        e.apply_quotes(&[upd(7, 4000, 4, 1.8, 4000)], Session::After, t + secs(10));
+        e.apply_quotes(&[upd(7, 5000, 5, 1.9, 5000)], Session::After, t + secs(20));
+        assert_eq!(e.high_low_counts(t + secs(20))[3], (1, 0));
+        // armed 60 s after the reseed
+        e.apply_quotes(&[upd(7, 6000, 6, 2.0, 6000)], Session::After, t + secs(71));
+        // 30 s: only the new one; 1 m: the first (71 s old) is out; 5 m: both
+        let c = e.high_low_counts(t + secs(71));
+        assert_eq!((c[3].0, c[2].0, c[1].0), (1, 1, 2));
     }
 
     #[test]

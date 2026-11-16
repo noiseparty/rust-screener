@@ -403,6 +403,12 @@ impl App {
         }
     }
 
+    /// Switches the rate panel between New Highs/Lows and Up/Down ticks and remembers the choice.
+    fn toggle_rate_tab(&mut self) {
+        self.cfg.rate_tab = self.cfg.rate_tab.toggled();
+        self.save_config();
+    }
+
     fn back_from_setup(&mut self) {
         self.view = if self.running { View::Dashboard } else { View::Boot };
     }
@@ -477,6 +483,7 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('t') => self.toggle_rate_tab(),
             KeyCode::Char('o') | KeyCode::Char('c') => self.open_setup(),
             KeyCode::Char('v') => {
                 self.view = View::Columns;

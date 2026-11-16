@@ -12,6 +12,34 @@ pub const FILTER_NAMES: [&str; 3] = ["ALL", "NEW", "SETUP"];
 const SETUP_KEY_MIGRATION: [(&str, &str); 2] =
     [("spike_vol_ratio", "setup_vol_ratio"), ("baseline_window_sec", "setup_window_sec")];
 
+/// The two panels of the rate area.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RateTab {
+    /// Price up / down ticks.
+    Ticks,
+    /// Session new highs / new lows (the default; an unknown value in the file also lands here).
+    #[default]
+    #[serde(other)]
+    HighsLows,
+}
+
+impl RateTab {
+    pub fn toggled(self) -> RateTab {
+        match self {
+            RateTab::HighsLows => RateTab::Ticks,
+            RateTab::Ticks => RateTab::HighsLows,
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            RateTab::HighsLows => "New Highs/Lows",
+            RateTab::Ticks => "Up/Down ticks",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -49,6 +77,8 @@ pub struct Config {
     /// Window of the Vol/m column. Old files call it `delta_window_seconds`.
     #[serde(alias = "delta_window_seconds")]
     pub vol_m_window_seconds: u64,
+    /// Which panel the rate area shows; `t` toggles it.
+    pub rate_tab: RateTab,
     pub blacklisted_tickers: Vec<String>,
     pub filter_enabled: BTreeMap<String, bool>,
     pub column_visibility: BTreeMap<String, bool>,
@@ -81,6 +111,7 @@ impl Default for Config {
             min_price: 0.0,
             max_price: 0.0,
             vol_m_window_seconds: 180,
+            rate_tab: RateTab::default(),
             blacklisted_tickers: Vec::new(),
             filter_enabled: FILTER_NAMES.iter().map(|f| (f.to_string(), true)).collect(),
             column_visibility: BTreeMap::new(),
@@ -330,6 +361,27 @@ mod tests {
         let mut cfg = Config { rank_tracking_interval_seconds: 2, ..Config::default() };
         cfg.validate();
         assert_eq!(cfg.rank_tracking_interval_seconds, 5);
+    }
+
+    #[test]
+    fn rate_tab_defaults_to_highs_lows_and_roundtrips() {
+        assert_eq!(Config::default().rate_tab, RateTab::HighsLows);
+        // an old file without the key gets the default
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.rate_tab, RateTab::HighsLows);
+        // an unknown value does not stop the file from loading
+        let cfg: Config = serde_json::from_str(r#"{"rate_tab":"bogus"}"#).unwrap();
+        assert_eq!(cfg.rate_tab, RateTab::HighsLows);
+
+        let p = tmp("rate_tab");
+        let cfg = Config { rate_tab: Config::default().rate_tab.toggled(), ..Config::default() };
+        assert_eq!(cfg.rate_tab, RateTab::Ticks);
+        cfg.save(&p).unwrap();
+        assert!(fs::read_to_string(&p).unwrap().contains(r#""rate_tab": "ticks""#));
+        let back = Config::load(&p).unwrap();
+        assert_eq!(back.rate_tab, RateTab::Ticks);
+        assert_eq!(back.rate_tab.toggled(), RateTab::HighsLows);
+        fs::remove_file(&p).unwrap();
     }
 
     #[test]
