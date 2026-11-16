@@ -135,11 +135,13 @@ impl Filters {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Thresholds {
-    pub spike_vol_ratio: f64,
-    pub pump_price_pct: f64,
+    /// SETUP: volume now / volume `setup_window` ago must reach this ...
+    pub setup_vol_ratio: f64,
+    /// ... and price change in percent versus `setup_window` ago must reach this.
+    pub setup_price_pct: f64,
+    pub setup_window: Duration,
     pub min_volume_for_alert: i64,
     pub min_price_for_alert: f64,
-    pub baseline_window: Duration,
     pub rank_interval: Duration,
     pub vol_m_window: Duration,
     pub max_alerts: usize,
@@ -148,11 +150,11 @@ pub struct Thresholds {
 impl Thresholds {
     pub fn from_config(c: &Config) -> Thresholds {
         Thresholds {
-            spike_vol_ratio: c.spike_vol_ratio,
-            pump_price_pct: c.pump_price_pct,
+            setup_vol_ratio: c.setup_vol_ratio,
+            setup_price_pct: c.setup_price_pct,
+            setup_window: Duration::from_secs(c.setup_window_sec),
             min_volume_for_alert: c.min_volume_for_alert,
             min_price_for_alert: c.min_price_for_alert,
-            baseline_window: Duration::from_secs(c.baseline_window_sec),
             rank_interval: Duration::from_secs(c.rank_tracking_interval_seconds),
             vol_m_window: Duration::from_secs(c.vol_m_window_seconds.max(MIN_VOL_M_WINDOW_SECS)),
             max_alerts: c.alert_history_max,
@@ -181,8 +183,6 @@ pub struct Engine {
     last: HashMap<String, Ticker>,
     /// Every ticker from the most recent process() call, for local re-filter/re-sort.
     latest: Vec<Ticker>,
-    vol_hist: HashMap<String, Vec<(Instant, i64)>>,
-    price_hist: HashMap<String, Vec<(Instant, f64)>>,
     /// Full-board order by % change (every listed symbol, blacklisted included), pushed
     /// whenever it changes; the entry in force at `now - rank_interval` is the Mov baseline.
     rank_ring: VecDeque<(Instant, Vec<String>)>,
@@ -213,8 +213,6 @@ impl Engine {
             blacklist: cfg.blacklisted_tickers.iter().cloned().collect(),
             last: HashMap::new(),
             latest: Vec::new(),
-            vol_hist: HashMap::new(),
-            price_hist: HashMap::new(),
             rank_ring: VecDeque::new(),
             passing: HashSet::new(),
             failing_since: HashMap::new(),
@@ -231,7 +229,6 @@ impl Engine {
     }
 
     /// Receive-time series of every listed (or lingering) ticker, keyed by tickerId.
-    #[allow(dead_code)] // read by SETUP (step 13)
     pub fn series(&self) -> &SeriesStore {
         &self.series
     }
@@ -240,6 +237,15 @@ impl Engine {
     pub fn on_stream_reconnect(&mut self) {
         self.series.clear_all();
         self.refresh_vol_rates(Instant::now());
+    }
+
+    /// Cumulative volume and price of `id` as they were `setup_window` before `now`, from the
+    /// series store. History shorter than the window falls back to the oldest sample.
+    /// `None` when the series is empty or cleared.
+    fn setup_base(&self, id: u64, now: Instant) -> Option<(u64, f64)> {
+        let first = self.series().oldest(id)?;
+        let at = now.checked_sub(self.th.setup_window).map_or(first.t, |s| s.max(first.t));
+        Some((self.series().vol_at(id, at)?, self.series().px_at(id, at)?))
     }
 
     /// Whether the data feed is silent; Vol/m shows a dash while it is.
@@ -435,15 +441,10 @@ impl Engine {
             (t.vol_rate, t.vol_partial, t.vol_stale) =
                 vol_m(&self.series, t.ticker_id, now, th.vol_m_window, self.feed_stale);
 
-            let vh = self.vol_hist.entry(t.symbol.clone()).or_default();
-            let base_vol = baseline(vh, now, th.baseline_window);
-            vh.push((now, t.volume));
-            prune(vh, now, th.baseline_window);
-
-            let ph = self.price_hist.entry(t.symbol.clone()).or_default();
-            let base_price = baseline(ph, now, th.baseline_window);
-            ph.push((now, t.price));
-            prune(ph, now, th.baseline_window);
+            // The value `setup_window` ago comes from the series store (receive time).
+            let base = self.setup_base(t.ticker_id, now);
+            let base_vol = base.map(|b| b.0 as i64);
+            let base_price = base.map(|b| b.1);
 
             let kind = match self.last.get(&t.symbol) {
                 None => Some(AlertKind::New),
@@ -454,16 +455,8 @@ impl Engine {
                         self.ticks.push_back((now, false));
                     }
                     let eligible = t.volume >= th.min_volume_for_alert && t.price >= th.min_price_for_alert;
-                    let spike = eligible
-                        && matches!(base_vol, Some(b) if b > 0 && t.volume as f64 / b as f64 >= th.spike_vol_ratio);
-                    let pump = eligible
-                        && matches!(base_price, Some(b) if b > 0.0 && (t.price - b) / b >= th.pump_price_pct);
-                    match (spike, pump) {
-                        (true, true) => Some(AlertKind::Setup),
-                        (true, false) => Some(AlertKind::Spike),
-                        (false, true) => Some(AlertKind::Pump),
-                        _ => None,
-                    }
+                    // SPIKE and PUMP are hidden for now: only SETUP (both conditions) is raised.
+                    (eligible && setup_met(&th, base, t.volume, t.price)).then_some(AlertKind::Setup)
                 }
             };
 
@@ -622,9 +615,24 @@ fn movements<'a>(old: Option<&[String]>, new: &'a [String], blacklist: &BTreeSet
         .collect()
 }
 
-/// Series history to keep: the longest look-back window plus a margin.
+/// Series history to keep: the longest look-back window (Vol/m or SETUP) plus a margin.
 fn series_horizon(th: &Thresholds) -> Duration {
-    th.vol_m_window.max(th.baseline_window) + SERIES_MARGIN
+    th.vol_m_window.max(th.setup_window) + SERIES_MARGIN
+}
+
+/// SETUP: versus the value `setup_window` ago (`base`: cumulative volume, price), the volume ratio
+/// is at least `setup_vol_ratio` and the price change is at least `setup_price_pct` percent.
+/// Both limits are inclusive. No baseline, or a baseline of 0, never triggers.
+fn setup_met(th: &Thresholds, base: Option<(u64, f64)>, vol: i64, price: f64) -> bool {
+    // Slack for float noise, so a move of exactly 10% off 1.00 counts as 10%.
+    const EPS: f64 = 1e-9;
+    let Some((base_vol, base_px)) = base else { return false };
+    if base_vol == 0 || !(base_px > 0.0) {
+        return false;
+    }
+    let ratio = vol as f64 / base_vol as f64;
+    let pct = (price - base_px) / base_px * 100.0;
+    ratio + EPS >= th.setup_vol_ratio && pct + EPS >= th.setup_price_pct
 }
 
 /// Vol/m of one ticker at `now`: (shares per minute, window only partly covered, feed stale).
@@ -652,22 +660,6 @@ fn vol_m(series: &SeriesStore, id: u64, now: Instant, window: Duration, stale: b
 /// Change ratio versus the previous close, when that is known.
 fn change_from(prev_close: f64, price: f64) -> Option<f64> {
     (prev_close > 0.0).then(|| price / prev_close - 1.0)
-}
-
-/// Oldest sample inside the window, falling back to the oldest sample overall.
-fn baseline<T: Copy>(hist: &[(Instant, T)], now: Instant, window: Duration) -> Option<T> {
-    hist.iter()
-        .find(|(at, _)| now.saturating_duration_since(*at) <= window)
-        .or(hist.first())
-        .map(|&(_, v)| v)
-}
-
-fn prune<T>(hist: &mut Vec<(Instant, T)>, now: Instant, window: Duration) {
-    let keep_from = hist
-        .iter()
-        .position(|(at, _)| now.saturating_duration_since(*at) <= window)
-        .unwrap_or(hist.len().saturating_sub(1));
-    hist.drain(..keep_from);
 }
 
 /// Places gained on the board; `None` for blank and new-entrant rows.
@@ -745,31 +737,205 @@ mod tests {
         assert!(!Filters { max_mcap: 1e9, ..Default::default() }.matches(&tk("B", 1.0, 1, 0.1, 0.0)));
     }
 
-    #[test]
-    fn new_then_setup() {
-        let mut e = engine();
-        let t0 = Instant::now();
-        let out = e.process(vec![tk("A", 1.0, 1000, 0.1, 0.0)], "change", true, t0);
-        assert_eq!(out.active[0].status, "NEW");
-        let out = e.process(vec![tk("A", 1.2, 3000, 0.3, 0.0)], "change", true, t0 + Duration::from_secs(5));
-        assert_eq!(out.active[0].status, "SETUP");
-        assert_eq!(e.alerts().back().unwrap().kind, AlertKind::Setup);
+    /// Engine with SETUP at 300 s / 2.2x / +10% and no eligibility gates.
+    fn setup_engine() -> Engine {
+        let mut cfg = Config::default();
+        cfg.max_market_cap = 0.0;
+        cfg.min_price_for_alert = 0.0;
+        cfg.min_volume_for_alert = 0;
+        cfg.setup_window_sec = 300;
+        cfg.setup_vol_ratio = 2.2;
+        cfg.setup_price_pct = 10.0;
+        Engine::new(&cfg)
+    }
+
+    fn setup_row(e: &mut Engine, t0: Instant, secs: u64, price: f64, vol: i64) -> Output {
+        let t = Ticker { ticker_id: 1, ..tk("A", price, vol, 0.3, 0.0) };
+        e.process(vec![t], "change", true, t0 + Duration::from_secs(secs))
+    }
+
+    fn kinds(e: &Engine) -> Vec<AlertKind> {
+        e.alerts().iter().map(|a| a.kind).collect()
     }
 
     #[test]
-    fn spike_only_and_pump_only() {
-        let mut e = engine();
+    fn setup_fires_exactly_at_both_limits() {
+        let mut e = setup_engine();
         let t0 = Instant::now();
-        e.process(vec![tk("S", 1.0, 1000, 0.1, 0.0), tk("P", 1.0, 1000, 0.1, 0.0)], "change", true, t0);
-        let out = e.process(
-            vec![tk("S", 1.0, 2500, 0.1, 0.0), tk("P", 1.10, 1100, 0.2, 0.0)],
-            "symbol",
-            false,
-            t0 + Duration::from_secs(5),
-        );
-        assert_eq!(out.active[0].status, "PUMP");
-        assert_eq!(out.active[1].status, "SPIKE");
+        let out = setup_row(&mut e, t0, 0, 1.0, 1000);
+        assert_eq!(out.active[0].status, "NEW");
+        // exactly 2.2x and exactly +10%, 300 s later
+        let out = setup_row(&mut e, t0, 300, 1.10, 2200);
+        assert_eq!(out.active[0].status, "SETUP");
+        let a = e.alerts().back().unwrap();
+        assert_eq!(a.kind, AlertKind::Setup);
+        assert_eq!((a.prev_vol, a.curr_vol, a.prev_price, a.curr_price), (1000, 2200, 1.0, 1.10));
+        assert_eq!(a.detail(), "vol 2.2x  +10.0%");
+    }
+
+    #[test]
+    fn setup_needs_both_limits() {
+        for (price, vol) in [(1.099, 2200), (1.10, 2199), (1.0, 9000), (3.0, 1000)] {
+            let mut e = setup_engine();
+            let t0 = Instant::now();
+            setup_row(&mut e, t0, 0, 1.0, 1000);
+            let out = setup_row(&mut e, t0, 300, price, vol);
+            assert_eq!(out.new_alerts, 0, "price {price} vol {vol}");
+            assert_eq!(kinds(&e), vec![AlertKind::New]);
+        }
+    }
+
+    #[test]
+    fn spike_and_pump_are_never_raised() {
+        let mut e = setup_engine();
+        let t0 = Instant::now();
+        let rows = |s_vol: i64, p_px: f64| {
+            vec![
+                Ticker { ticker_id: 1, ..tk("S", 1.0, s_vol, 0.1, 0.0) },
+                Ticker { ticker_id: 2, ..tk("P", p_px, 1000, 0.5, 0.0) },
+            ]
+        };
+        e.process(rows(1000, 1.0), "change", true, t0);
+        // S: volume x5, flat price (a SPIKE before). P: price +50%, flat volume (a PUMP before).
+        let out = e.process(rows(5000, 1.5), "symbol", false, t0 + Duration::from_secs(5));
+        assert_eq!(out.new_alerts, 0);
+        assert!(out.active.iter().all(|t| t.status.is_empty()));
+        assert!(kinds(&e).iter().all(|k| *k == AlertKind::New));
+        // the tick counter still follows the price move
         assert_eq!(e.tick_rates(t0 + Duration::from_secs(6))[3], (0, 1));
+    }
+
+    #[test]
+    fn setup_with_short_history_compares_to_the_oldest_sample() {
+        let mut e = setup_engine();
+        let t0 = Instant::now();
+        setup_row(&mut e, t0, 0, 1.0, 1000);
+        // only 20 s of history, window is 300 s
+        let out = setup_row(&mut e, t0, 20, 1.2, 3000);
+        assert_eq!(out.active[0].status, "SETUP");
+    }
+
+    #[test]
+    fn setup_without_a_series_never_fires() {
+        let mut e = setup_engine();
+        let t0 = Instant::now();
+        // ticker id 0 has no series
+        let z = |p: f64, v: i64| vec![tk("Z", p, v, 0.3, 0.0)];
+        e.process(z(1.0, 1000), "change", true, t0);
+        let out = e.process(z(2.0, 9000), "change", true, t0 + Duration::from_secs(300));
+        assert_eq!(out.new_alerts, 0);
+        // a ticker's very first sample is its own baseline
+        let mut e = setup_engine();
+        assert_eq!(setup_row(&mut e, t0, 0, 5.0, 9000).active[0].status, "NEW");
+        assert_eq!(kinds(&e), vec![AlertKind::New]);
+    }
+
+    #[test]
+    fn cleared_series_needs_new_history() {
+        let mut e = setup_engine();
+        let t0 = Instant::now();
+        setup_row(&mut e, t0, 0, 1.0, 1000);
+        e.on_stream_reconnect();
+        // The jump is real, but the baseline is gone: the new series starts at this sample.
+        let out = setup_row(&mut e, t0, 300, 1.5, 5000);
+        assert_eq!(out.new_alerts, 0);
+        // History rebuilt after the clear works again.
+        let out = setup_row(&mut e, t0, 600, 1.65, 11_000);
+        assert_eq!(out.active[0].status, "SETUP");
+    }
+
+    #[test]
+    fn setup_baseline_is_the_value_one_window_ago_not_the_oldest() {
+        let mut e = setup_engine();
+        let t0 = Instant::now();
+        setup_row(&mut e, t0, 0, 1.0, 1000);
+        setup_row(&mut e, t0, 100, 1.5, 5000);
+        // Against t=0 this is 9x and +65%; against the point at or before t=100 (300 s ago) it is
+        // 1.8x and +10%: not a SETUP.
+        let out = setup_row(&mut e, t0, 400, 1.65, 9000);
+        assert_eq!(out.new_alerts, 0);
+        // 11000 / 5000 = 2.2x and 1.65 / 1.5 = +10%: SETUP
+        let out = setup_row(&mut e, t0, 400, 1.65, 11_000);
+        assert_eq!(out.active[0].status, "SETUP");
+    }
+
+    #[test]
+    fn setup_respects_the_alert_gates() {
+        let mut cfg = Config::default();
+        cfg.max_market_cap = 0.0;
+        cfg.min_volume_for_alert = 5000;
+        cfg.min_price_for_alert = 1.0;
+        let t0 = Instant::now();
+        // volume below the gate, price above
+        let mut e = Engine::new(&cfg);
+        setup_row(&mut e, t0, 0, 1.0, 1000);
+        assert_eq!(setup_row(&mut e, t0, 300, 1.2, 4999).new_alerts, 0);
+        // price below the gate (volume above)
+        let mut e = Engine::new(&cfg);
+        setup_row(&mut e, t0, 0, 0.5, 10_000);
+        assert_eq!(setup_row(&mut e, t0, 300, 0.99, 30_000).new_alerts, 0);
+        // exactly at both gates
+        let mut e = Engine::new(&cfg);
+        setup_row(&mut e, t0, 0, 0.5, 2000);
+        assert_eq!(setup_row(&mut e, t0, 300, 1.0, 5000).new_alerts, 1);
+    }
+
+    #[test]
+    fn setup_reads_the_stream_series_and_live_quote() {
+        let (mut e, t0) = live_engine();
+        e.set_rest_feeds_series(false);
+        let at = |mut u: Update, s: u64| {
+            u.recv = t0 + Duration::from_secs(s);
+            u
+        };
+        e.apply_quotes(&[at(upd(7, 1000, 1, 1.0, 1000), 10)], Session::Reg, t0 + Duration::from_secs(10));
+        e.apply_quotes(&[at(upd(7, 301_000, 2, 1.10, 2200), 310)], Session::Reg, t0 + Duration::from_secs(310));
+        // a stale REST row; the fresh stream quote overrides it
+        let rest = Ticker { ticker_id: 7, prev_close: 1.0, ..tk("A", 1.0, 1000, 0.0, 5e6) };
+        let out = e.process(vec![rest], "change", true, t0 + Duration::from_secs(311));
+        assert_eq!(out.active[0].status, "SETUP");
+        assert_eq!(e.alerts().back().unwrap().prev_vol, 1000);
+    }
+
+    #[test]
+    fn setup_met_edges() {
+        let th = Thresholds::from_config(&Config::default());
+        assert!(setup_met(&th, Some((1000, 1.0)), 2200, 1.10));
+        assert!(!setup_met(&th, Some((1000, 1.0)), 2199, 1.10));
+        assert!(!setup_met(&th, Some((1000, 1.0)), 2200, 1.0999));
+        assert!(!setup_met(&th, None, 2200, 1.10));
+        assert!(!setup_met(&th, Some((0, 1.0)), 2200, 1.10));
+        assert!(!setup_met(&th, Some((1000, 0.0)), 2200, 1.10));
+        // a falling price never counts
+        assert!(!setup_met(&th, Some((1000, 1.0)), 5000, 0.5));
+    }
+
+    #[test]
+    fn config_change_moves_the_setup_limits() {
+        let mut e = setup_engine();
+        let t0 = Instant::now();
+        setup_row(&mut e, t0, 0, 1.0, 1000);
+        let mut cfg = Config::default();
+        cfg.max_market_cap = 0.0;
+        cfg.min_price_for_alert = 0.0;
+        cfg.min_volume_for_alert = 0;
+        cfg.setup_window_sec = 60;
+        cfg.setup_vol_ratio = 1.5;
+        cfg.setup_price_pct = 5.0;
+        e.apply_config(&cfg);
+        let out = setup_row(&mut e, t0, 60, 1.05, 1500);
+        assert_eq!(out.active[0].status, "SETUP");
+    }
+
+    #[test]
+    fn series_horizon_follows_the_longer_of_vol_m_and_setup_windows() {
+        let mut cfg = Config::default();
+        cfg.vol_m_window_seconds = 30;
+        cfg.setup_window_sec = 200;
+        assert_eq!(series_horizon(&Thresholds::from_config(&cfg)), Duration::from_secs(260));
+        cfg.vol_m_window_seconds = 300;
+        cfg.setup_window_sec = 60;
+        assert_eq!(series_horizon(&Thresholds::from_config(&cfg)), Duration::from_secs(360));
     }
 
     /// Engine whose REST rows (ticker 1) feed the series; Vol/m window `w` seconds.
@@ -963,12 +1129,12 @@ mod tests {
         cfg.max_market_cap = 0.0;
         cfg.min_price = 5.0;
         let mut e = Engine::new(&cfg);
-        let out = e.process(vec![tk("F", 1.0, 1000, 0.1, 0.0)], "change", true, Instant::now());
+        let f = Ticker { ticker_id: 9, ..tk("F", 1.0, 1000, 0.1, 0.0) };
+        let out = e.process(vec![f], "change", true, Instant::now());
         assert!(out.active.is_empty());
         assert_eq!(out.new_alerts, 0);
         assert!(e.alerts.is_empty());
-        assert_eq!(e.vol_hist["F"].len(), 1);
-        assert_eq!(e.price_hist["F"].len(), 1);
+        assert_eq!(e.series().len(9), 1);
         assert!(e.candles("F").is_some());
     }
 
@@ -976,9 +1142,14 @@ mod tests {
     fn reapply_refilters_and_resorts_without_recording() {
         let mut e = engine();
         let t0 = Instant::now();
-        e.process(vec![tk("A", 1.0, 1000, 0.1, 0.0), tk("B", 9.0, 1000, 0.2, 0.0)], "change", true, t0);
+        e.process(
+            vec![Ticker { ticker_id: 1, ..tk("A", 1.0, 1000, 0.1, 0.0) }, tk("B", 9.0, 1000, 0.2, 0.0)],
+            "change",
+            true,
+            t0,
+        );
         let alerts = e.alerts.len();
-        let samples = e.vol_hist["A"].len();
+        let samples = e.series().len(1);
         let out = e.reapply("price", true, Instant::now());
         assert_eq!(out.active[0].symbol, "B");
         e.apply_config(&Config { min_price: 5.0, max_market_cap: 0.0, ..Config::default() });
@@ -986,7 +1157,7 @@ mod tests {
         assert_eq!(out.active.len(), 1);
         assert_eq!(out.active[0].symbol, "B");
         assert_eq!(e.alerts.len(), alerts);
-        assert_eq!(e.vol_hist["A"].len(), samples);
+        assert_eq!(e.series().len(1), samples);
     }
 
     #[test]
@@ -1469,7 +1640,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.max_market_cap = 0.0;
         cfg.vol_m_window_seconds = 30;
-        cfg.baseline_window_sec = 30;
+        cfg.setup_window_sec = 30;
         let mut e = Engine::new(&cfg);
         let t0 = Instant::now();
         let a = |v: i64| Ticker { ticker_id: 1, ..tk("A", 1.0, v, 0.1, 0.0) };

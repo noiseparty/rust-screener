@@ -43,13 +43,13 @@ pub struct Field {
 pub const FIELDS: [Field; 16] = [
     Field { label: "Min Market Cap", desc: "Minimum market cap to display. K/M/B suffixes allowed (500K, 1M). 0 disables.", kind: FieldKind::Smart },
     Field { label: "Max Market Cap", desc: "Maximum market cap to display. K/M/B suffixes allowed (1B). 0 disables.", kind: FieldKind::Smart },
-    Field { label: "Spike Vol Ratio", desc: "Volume multiple over the baseline window that fires SPIKE. 2.0 = volume doubled.", kind: FieldKind::Float },
-    Field { label: "Pump Price Pct", desc: "Price return over the baseline window that fires PUMP. 0.05 = +5%.", kind: FieldKind::Float },
+    Field { label: "SETUP Volume Ratio", desc: "SETUP needs volume at least this multiple of the volume one SETUP window ago. 2.2 = 2.2x.", kind: FieldKind::Float },
+    Field { label: "SETUP Price %", desc: "SETUP also needs price up at least this percent over the SETUP window. 10 = +10%.", kind: FieldKind::Float },
     Field { label: "Refresh Rate (s)", desc: "How often to poll Webull, in seconds.", kind: FieldKind::Int },
     Field { label: "Rank Track (s)", desc: "Window for rank movement (Mov column). 60 = compare to rank 60s ago.", kind: FieldKind::Int },
-    Field { label: "Baseline Window (s)", desc: "Lookback used as the baseline for SPIKE and PUMP detection.", kind: FieldKind::Int },
-    Field { label: "Min Vol Alert", desc: "Minimum volume required before SPIKE/PUMP can fire.", kind: FieldKind::Int },
-    Field { label: "Min Price Alert ($)", desc: "Minimum price required before SPIKE/PUMP can fire.", kind: FieldKind::Float },
+    Field { label: "SETUP Window (s)", desc: "How far back SETUP compares volume and price. 300 = versus 5 minutes ago.", kind: FieldKind::Int },
+    Field { label: "Min Vol Alert", desc: "Minimum volume required before SETUP can fire.", kind: FieldKind::Int },
+    Field { label: "Min Price Alert ($)", desc: "Minimum price required before SETUP can fire.", kind: FieldKind::Float },
     Field { label: "Vol/m Window (s)", desc: "Window for the Vol/m column (min 30). 180 = average shares per minute over the last 3 minutes.", kind: FieldKind::Int },
     Field { label: "Min % Change", desc: "Only show tickers up at least this %. 0 disables.", kind: FieldKind::Float },
     Field { label: "Max % Change", desc: "Only show tickers up at most this %. 0 disables.", kind: FieldKind::Float },
@@ -581,11 +581,11 @@ impl App {
         let c = &mut self.cfg;
         c.min_market_cap = vals[0];
         c.max_market_cap = vals[1];
-        c.spike_vol_ratio = vals[2];
-        c.pump_price_pct = vals[3];
+        c.setup_vol_ratio = vals[2];
+        c.setup_price_pct = vals[3];
         c.refresh_interval_seconds = vals[4] as u64;
         c.rank_tracking_interval_seconds = vals[5] as u64;
-        c.baseline_window_sec = vals[6] as u64;
+        c.setup_window_sec = vals[6] as u64;
         c.min_volume_for_alert = vals[7] as i64;
         c.min_price_for_alert = vals[8];
         c.vol_m_window_seconds = vals[9] as u64;
@@ -702,11 +702,11 @@ fn inputs_from(c: &Config) -> Vec<String> {
     vec![
         format!("{:.0}", c.min_market_cap),
         format!("{:.0}", c.max_market_cap),
-        format!("{:.2}", c.spike_vol_ratio),
-        format!("{:.2}", c.pump_price_pct),
+        format!("{:.2}", c.setup_vol_ratio),
+        format!("{:.2}", c.setup_price_pct),
         c.refresh_interval_seconds.to_string(),
         c.rank_tracking_interval_seconds.to_string(),
-        c.baseline_window_sec.to_string(),
+        c.setup_window_sec.to_string(),
         c.min_volume_for_alert.to_string(),
         format!("{:.2}", c.min_price_for_alert),
         c.vol_m_window_seconds.to_string(),

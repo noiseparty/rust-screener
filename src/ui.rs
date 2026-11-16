@@ -714,11 +714,9 @@ fn setup_filters(f: &mut Frame, app: &App) {
     let descs = [
         "Show every enabled alert type",
         "Ticker just appeared in the gainers list",
-        "Price up past Pump Price Pct over the baseline window",
-        "Volume past Spike Vol Ratio over the baseline window",
-        "SPIKE and PUMP at the same time",
+        "Volume ratio and price change both past their SETUP limits",
     ];
-    let rect = centered(f.area(), 76, 12);
+    let rect = centered(f.area(), 76, 9);
     let mut lines = vec![Line::raw("")];
     for (i, name) in FILTER_NAMES.iter().enumerate() {
         let on = app.cfg.filter_on(name);

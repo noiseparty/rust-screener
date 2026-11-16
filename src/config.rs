@@ -4,7 +4,13 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-pub const FILTER_NAMES: [&str; 5] = ["ALL", "NEW", "PUMP", "SPIKE", "SETUP"];
+/// Alert kinds that can be raised and filtered. SPIKE and PUMP are hidden for now (their enum
+/// variants stay in the engine so they can return).
+pub const FILTER_NAMES: [&str; 3] = ["ALL", "NEW", "SETUP"];
+
+/// Old config keys and the SETUP keys that replaced them (value copied as is).
+const SETUP_KEY_MIGRATION: [(&str, &str); 2] =
+    [("spike_vol_ratio", "setup_vol_ratio"), ("baseline_window_sec", "setup_window_sec")];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -19,10 +25,14 @@ pub struct Config {
     /// Re-rank / re-sort tick in milliseconds: 500 or 1000.
     pub recompute_ms: u64,
 
-    // SPIKE / PUMP alert thresholds
-    pub spike_vol_ratio: f64,
-    pub pump_price_pct: f64,
-    pub baseline_window_sec: u64,
+    // SETUP: volume ratio and price change versus `setup_window_sec` ago
+    /// Window of the SETUP look-back, in seconds. Old files call it `baseline_window_sec`.
+    pub setup_window_sec: u64,
+    /// Volume now divided by volume `setup_window_sec` ago. Old files: `spike_vol_ratio`.
+    pub setup_vol_ratio: f64,
+    /// Price change in percent versus `setup_window_sec` ago (10 = +10%). Old files: `pump_price_pct`
+    /// (a fraction, 0.05 = 5%).
+    pub setup_price_pct: f64,
     pub min_volume_for_alert: i64,
     pub min_price_for_alert: f64,
 
@@ -56,9 +66,9 @@ impl Default for Config {
             max_market_cap: 1e15,
             rank_tracking_interval_seconds: 60,
             recompute_ms: 1000,
-            spike_vol_ratio: 2.0,
-            pump_price_pct: 0.05,
-            baseline_window_sec: 300,
+            setup_window_sec: 300,
+            setup_vol_ratio: 2.2,
+            setup_price_pct: 10.0,
             min_volume_for_alert: 10_000,
             min_price_for_alert: 1.0,
             min_change_percent: 0.0,
@@ -86,10 +96,31 @@ impl Config {
             return Ok(cfg);
         }
         let data = fs::read_to_string(path)?;
-        let mut cfg: Config = serde_json::from_str(&data)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let mut cfg = Config::from_json(&data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         cfg.validate();
         Ok(cfg)
+    }
+
+    /// Parses a config file, first moving the pre-SETUP keys to their new names. A new key
+    /// already in the file wins over the old one.
+    fn from_json(text: &str) -> Result<Config, serde_json::Error> {
+        let mut v: serde_json::Value = serde_json::from_str(text)?;
+        if let Some(obj) = v.as_object_mut() {
+            for (old, new) in SETUP_KEY_MIGRATION {
+                if let Some(val) = obj.remove(old) {
+                    obj.entry(new).or_insert(val);
+                }
+            }
+            // The old pump threshold was a fraction (0.05); SETUP Price % is entered as a percent.
+            if let Some(val) = obj.remove("pump_price_pct") {
+                let pct = match val.as_f64() {
+                    Some(f) if f <= 1.0 => serde_json::json!((f * 100.0 * 1e6).round() / 1e6),
+                    _ => val,
+                };
+                obj.entry("setup_price_pct").or_insert(pct);
+            }
+        }
+        serde_json::from_value(v)
     }
 
     pub fn save(&self, path: &Path) -> io::Result<()> {
@@ -113,14 +144,14 @@ impl Config {
         if self.recompute_ms != 500 {
             self.recompute_ms = 1000;
         }
-        if self.spike_vol_ratio <= 0.0 {
-            self.spike_vol_ratio = 2.0;
+        if !(self.setup_vol_ratio > 0.0 && self.setup_vol_ratio.is_finite()) {
+            self.setup_vol_ratio = 2.2;
         }
-        if self.pump_price_pct <= 0.0 {
-            self.pump_price_pct = 0.05;
+        if !(self.setup_price_pct > 0.0 && self.setup_price_pct.is_finite()) {
+            self.setup_price_pct = 10.0;
         }
-        if self.baseline_window_sec == 0 {
-            self.baseline_window_sec = 300;
+        if self.setup_window_sec == 0 {
+            self.setup_window_sec = 300;
         }
         if self.vol_m_window_seconds == 0 {
             self.vol_m_window_seconds = 180;
@@ -170,13 +201,13 @@ mod tests {
         let p = tmp("validate");
         fs::write(
             &p,
-            r#"{"refresh_interval_seconds":0,"alert_history_max":2,"spike_vol_ratio":-1,"delta_window_seconds":0,"filter_enabled":{"ALL":false}}"#,
+            r#"{"refresh_interval_seconds":0,"alert_history_max":2,"setup_vol_ratio":-1,"delta_window_seconds":0,"filter_enabled":{"ALL":false}}"#,
         )
         .unwrap();
         let cfg = Config::load(&p).unwrap();
         assert_eq!(cfg.refresh_interval_seconds, 1);
         assert_eq!(cfg.alert_history_max, 10);
-        assert_eq!(cfg.spike_vol_ratio, 2.0);
+        assert_eq!(cfg.setup_vol_ratio, 2.2);
         assert_eq!(cfg.vol_m_window_seconds, 180);
         assert!(!cfg.filter_on("ALL"));
         assert!(cfg.filter_on("SETUP"));
@@ -196,6 +227,63 @@ mod tests {
         let text = fs::read_to_string(&p).unwrap();
         assert!(text.contains("vol_m_window_seconds") && !text.contains("delta_window_seconds"));
         fs::remove_file(&p).unwrap();
+    }
+
+    #[test]
+    fn setup_defaults() {
+        let c = Config::default();
+        assert_eq!((c.setup_window_sec, c.setup_vol_ratio, c.setup_price_pct), (300, 2.2, 10.0));
+        // an old file without any of the keys gets the defaults
+        let c: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!((c.setup_window_sec, c.setup_vol_ratio, c.setup_price_pct), (300, 2.2, 10.0));
+    }
+
+    #[test]
+    fn old_spike_pump_baseline_keys_migrate_to_setup_keys() {
+        let p = tmp("setup_migrate");
+        fs::write(&p, r#"{"spike_vol_ratio":3.5,"pump_price_pct":0.07,"baseline_window_sec":120,"min_price":0.3}"#).unwrap();
+        let cfg = Config::load(&p).unwrap();
+        assert_eq!(cfg.setup_vol_ratio, 3.5);
+        assert_eq!(cfg.setup_price_pct, 7.0); // fraction became percent, no float noise
+        assert_eq!(cfg.setup_window_sec, 120);
+        assert_eq!(cfg.min_price, 0.3);
+        // saved under the new names only
+        cfg.save(&p).unwrap();
+        let text = fs::read_to_string(&p).unwrap();
+        for old in ["spike_vol_ratio", "pump_price_pct", "baseline_window_sec"] {
+            assert!(!text.contains(old), "{old} still saved");
+        }
+        assert_eq!(Config::load(&p).unwrap(), cfg);
+        fs::remove_file(&p).unwrap();
+    }
+
+    #[test]
+    fn old_pump_pct_above_one_is_already_a_percent() {
+        let cfg = Config::from_json(r#"{"pump_price_pct":12}"#).unwrap();
+        assert_eq!(cfg.setup_price_pct, 12.0);
+        let cfg = Config::from_json(r#"{"pump_price_pct":1}"#).unwrap();
+        assert_eq!(cfg.setup_price_pct, 100.0);
+    }
+
+    #[test]
+    fn new_setup_keys_win_over_old_ones() {
+        let cfg = Config::from_json(
+            r#"{"spike_vol_ratio":9,"setup_vol_ratio":2.5,"pump_price_pct":0.5,"setup_price_pct":8,"baseline_window_sec":9,"setup_window_sec":60}"#,
+        )
+        .unwrap();
+        assert_eq!((cfg.setup_vol_ratio, cfg.setup_price_pct, cfg.setup_window_sec), (2.5, 8.0, 60));
+    }
+
+    #[test]
+    fn bad_setup_values_fall_back() {
+        let mut cfg = Config { setup_vol_ratio: 0.0, setup_price_pct: -3.0, setup_window_sec: 0, ..Config::default() };
+        cfg.validate();
+        assert_eq!((cfg.setup_window_sec, cfg.setup_vol_ratio, cfg.setup_price_pct), (300, 2.2, 10.0));
+    }
+
+    #[test]
+    fn spike_and_pump_are_not_alert_filters() {
+        assert_eq!(FILTER_NAMES, ["ALL", "NEW", "SETUP"]);
     }
 
     #[test]

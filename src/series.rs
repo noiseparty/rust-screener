@@ -126,7 +126,7 @@ impl SeriesStore {
 
     /// Number of all-series clears so far (session/date change, reconnect). Other state that
     /// must reset at the same moments (rank ring, badges) can watch this counter.
-    #[allow(dead_code)] // read API for SETUP (step 13)
+    #[allow(dead_code)] // for resetting cooldown/badge state with the series
     pub fn resets(&self) -> u64 {
         self.resets
     }
@@ -252,7 +252,6 @@ impl SeriesStore {
     }
 
     /// Price of the last point at or before `t`; `None` if `t` precedes the series.
-    #[allow(dead_code)] // read API for SETUP (step 13)
     pub fn px_at(&self, id: u64, t: Instant) -> Option<f64> {
         self.sample_at(id, t).map(|p| p.px)
     }
@@ -266,12 +265,12 @@ impl SeriesStore {
         self.map.get(&id)?.pts.front().copied()
     }
 
-    #[allow(dead_code)] // read API for SETUP (step 13)
+    #[allow(dead_code)] // only tests read this
     pub fn latest(&self, id: u64) -> Option<Sample> {
         self.map.get(&id)?.pts.back().copied()
     }
 
-    #[allow(dead_code)] // read API for SETUP (step 13)
+    #[allow(dead_code)] // only tests read this
     pub fn len(&self, id: u64) -> usize {
         self.map.get(&id).map_or(0, |s| s.pts.len())
     }
