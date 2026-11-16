@@ -100,7 +100,6 @@ impl Series {
     }
 
     /// Last point with time <= `t`.
-    #[allow(dead_code)] // read API for Vol/m, SETUP and probe mode (later steps)
     fn at(&self, t: Instant) -> Option<Sample> {
         let i = self.pts.partition_point(|p| p.t <= t);
         i.checked_sub(1).map(|i| self.pts[i])
@@ -127,7 +126,7 @@ impl SeriesStore {
 
     /// Number of all-series clears so far (session/date change, reconnect). Other state that
     /// must reset at the same moments (rank ring, badges) can watch this counter.
-    #[allow(dead_code)] // read API for Vol/m, SETUP and probe mode (later steps)
+    #[allow(dead_code)] // read API for SETUP (step 13)
     pub fn resets(&self) -> u64 {
         self.resets
     }
@@ -248,34 +247,31 @@ impl SeriesStore {
     }
 
     /// Cumulative volume of the last point at or before `t`; `None` if `t` precedes the series.
-    #[allow(dead_code)] // read API for Vol/m, SETUP and probe mode (later steps)
     pub fn vol_at(&self, id: u64, t: Instant) -> Option<u64> {
         self.sample_at(id, t).map(|p| p.vol)
     }
 
     /// Price of the last point at or before `t`; `None` if `t` precedes the series.
-    #[allow(dead_code)] // read API for Vol/m, SETUP and probe mode (later steps)
+    #[allow(dead_code)] // read API for SETUP (step 13)
     pub fn px_at(&self, id: u64, t: Instant) -> Option<f64> {
         self.sample_at(id, t).map(|p| p.px)
     }
 
-    #[allow(dead_code)] // read API for Vol/m, SETUP and probe mode (later steps)
     pub fn sample_at(&self, id: u64, t: Instant) -> Option<Sample> {
         self.map.get(&id)?.at(t)
     }
 
     /// Oldest retained point (fallback when history is shorter than a window).
-    #[allow(dead_code)] // read API for Vol/m, SETUP and probe mode (later steps)
     pub fn oldest(&self, id: u64) -> Option<Sample> {
         self.map.get(&id)?.pts.front().copied()
     }
 
-    #[allow(dead_code)] // read API for Vol/m, SETUP and probe mode (later steps)
+    #[allow(dead_code)] // read API for SETUP (step 13)
     pub fn latest(&self, id: u64) -> Option<Sample> {
         self.map.get(&id)?.pts.back().copied()
     }
 
-    #[allow(dead_code)] // read API for Vol/m, SETUP and probe mode (later steps)
+    #[allow(dead_code)] // read API for SETUP (step 13)
     pub fn len(&self, id: u64) -> usize {
         self.map.get(&id).map_or(0, |s| s.pts.len())
     }

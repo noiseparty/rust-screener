@@ -23,7 +23,7 @@ pub const COLUMNS: [Column; 8] = [
     Column { key: "change", title: "% Chg", width: 9, priority: 1 },
     Column { key: "volume", title: "Volume", width: 9, priority: 2 },
     Column { key: "mcap", title: "Mkt Cap", width: 9, priority: 3 },
-    Column { key: "delta", title: "Δ Vol", width: 10, priority: 3 },
+    Column { key: "volrate", title: "Vol/m", width: 10, priority: 3 },
     Column { key: "status", title: "Status", width: 7, priority: 1 },
 ];
 
@@ -50,7 +50,7 @@ pub const FIELDS: [Field; 16] = [
     Field { label: "Baseline Window (s)", desc: "Lookback used as the baseline for SPIKE and PUMP detection.", kind: FieldKind::Int },
     Field { label: "Min Vol Alert", desc: "Minimum volume required before SPIKE/PUMP can fire.", kind: FieldKind::Int },
     Field { label: "Min Price Alert ($)", desc: "Minimum price required before SPIKE/PUMP can fire.", kind: FieldKind::Float },
-    Field { label: "Delta Window (s)", desc: "Window for the volume delta column. 180 = volume added in the last 3 minutes.", kind: FieldKind::Int },
+    Field { label: "Vol/m Window (s)", desc: "Window for the Vol/m column (min 30). 180 = average shares per minute over the last 3 minutes.", kind: FieldKind::Int },
     Field { label: "Min % Change", desc: "Only show tickers up at least this %. 0 disables.", kind: FieldKind::Float },
     Field { label: "Max % Change", desc: "Only show tickers up at most this %. 0 disables.", kind: FieldKind::Float },
     Field { label: "Min Volume", desc: "Only show tickers with at least this volume. 0 disables.", kind: FieldKind::Int },
@@ -84,6 +84,8 @@ pub enum View {
 pub const LIST_REFRESH: u64 = 20;
 /// No stream message or status for this long means the stream is down.
 const STREAM_STALE: Duration = Duration::from_secs(15);
+/// Vol/m is recomputed this often, so a quiet ticker decays between messages.
+const VOL_REFRESH: Duration = Duration::from_secs(1);
 
 pub enum Msg {
     Fetched(Result<Fetched, String>),
@@ -106,6 +108,8 @@ pub struct App {
     stream: StreamStatus,
     stream_status_at: Option<Instant>,
     last_fetch: Option<Instant>,
+    last_ok_fetch: Option<Instant>,
+    last_vol_refresh: Instant,
     fetching: bool,
     running: bool,
     pub next_refresh: Instant,
@@ -167,6 +171,8 @@ impl App {
             stream: StreamStatus::default(),
             stream_status_at: None,
             last_fetch: None,
+            last_ok_fetch: None,
+            last_vol_refresh: now,
             fetching: false,
             running: false,
             next_refresh: now,
@@ -239,8 +245,24 @@ impl App {
         }
     }
 
+    /// No fresh data: the stream is down and the REST list has not answered for a while.
+    fn feed_stale(&self, now: Instant) -> bool {
+        if self.stream_ok() {
+            return false;
+        }
+        let limit = Duration::from_secs((self.poll_interval() * 3).max(10));
+        self.last_ok_fetch.is_none_or(|t| now.saturating_duration_since(t) > limit)
+    }
+
     pub fn on_tick(&mut self, now: Instant) {
         self.engine.set_rest_feeds_series(!self.stream_ok());
+        let stale = self.feed_stale(now);
+        self.engine.set_feed_stale(stale);
+        if now.saturating_duration_since(self.last_vol_refresh) >= VOL_REFRESH {
+            self.last_vol_refresh = now;
+            self.engine.refresh_vol_rates(now);
+            self.reapply_local();
+        }
         if self.engine.expire_series(now) {
             self.send_subscriptions();
         }
@@ -267,6 +289,7 @@ impl App {
                     Err(e) => self.error = Some(e),
                     Ok(f) => {
                         self.error = None;
+                        self.last_ok_fetch = Some(Instant::now());
                         self.all = f.tickers.clone();
                         self.group = f.group;
                         self.session = f.session;
@@ -553,7 +576,7 @@ impl App {
         c.baseline_window_sec = vals[6] as u64;
         c.min_volume_for_alert = vals[7] as i64;
         c.min_price_for_alert = vals[8];
-        c.delta_window_seconds = vals[9] as u64;
+        c.vol_m_window_seconds = vals[9] as u64;
         c.min_change_percent = vals[10];
         c.max_change_percent = vals[11];
         c.min_volume = vals[12] as i64;
@@ -674,7 +697,7 @@ fn inputs_from(c: &Config) -> Vec<String> {
         c.baseline_window_sec.to_string(),
         c.min_volume_for_alert.to_string(),
         format!("{:.2}", c.min_price_for_alert),
-        c.delta_window_seconds.to_string(),
+        c.vol_m_window_seconds.to_string(),
         format!("{:.1}", c.min_change_percent),
         format!("{:.1}", c.max_change_percent),
         c.min_volume.to_string(),

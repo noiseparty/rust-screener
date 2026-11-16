@@ -32,7 +32,9 @@ pub struct Config {
     pub min_price: f64,
     pub max_price: f64,
 
-    pub delta_window_seconds: u64,
+    /// Window of the Vol/m column. Old files call it `delta_window_seconds`.
+    #[serde(alias = "delta_window_seconds")]
+    pub vol_m_window_seconds: u64,
     pub blacklisted_tickers: Vec<String>,
     pub filter_enabled: BTreeMap<String, bool>,
     pub column_visibility: BTreeMap<String, bool>,
@@ -62,7 +64,7 @@ impl Default for Config {
             max_volume: 0,
             min_price: 0.0,
             max_price: 0.0,
-            delta_window_seconds: 180,
+            vol_m_window_seconds: 180,
             blacklisted_tickers: Vec::new(),
             filter_enabled: FILTER_NAMES.iter().map(|f| (f.to_string(), true)).collect(),
             column_visibility: BTreeMap::new(),
@@ -112,8 +114,14 @@ impl Config {
         if self.baseline_window_sec == 0 {
             self.baseline_window_sec = 300;
         }
-        if self.delta_window_seconds == 0 {
-            self.delta_window_seconds = 180;
+        if self.vol_m_window_seconds == 0 {
+            self.vol_m_window_seconds = 180;
+        } else if self.vol_m_window_seconds < 30 {
+            self.vol_m_window_seconds = 30;
+        }
+        // The "delta" column became "volrate" (Vol/m).
+        if let Some(v) = self.column_visibility.remove("delta") {
+            self.column_visibility.entry("volrate".to_string()).or_insert(v);
         }
         for f in FILTER_NAMES {
             self.filter_enabled.entry(f.to_string()).or_insert(true);
@@ -161,10 +169,32 @@ mod tests {
         assert_eq!(cfg.refresh_interval_seconds, 1);
         assert_eq!(cfg.alert_history_max, 10);
         assert_eq!(cfg.spike_vol_ratio, 2.0);
-        assert_eq!(cfg.delta_window_seconds, 180);
+        assert_eq!(cfg.vol_m_window_seconds, 180);
         assert!(!cfg.filter_on("ALL"));
         assert!(cfg.filter_on("SETUP"));
         fs::remove_file(&p).unwrap();
+    }
+
+    #[test]
+    fn old_delta_window_key_and_column_migrate() {
+        let p = tmp("migrate");
+        fs::write(&p, r#"{"delta_window_seconds":120,"column_visibility":{"delta":false,"mcap":true}}"#).unwrap();
+        let cfg = Config::load(&p).unwrap();
+        assert_eq!(cfg.vol_m_window_seconds, 120);
+        assert!(!cfg.column_visible("volrate"));
+        assert!(!cfg.column_visibility.contains_key("delta"));
+        // saved under the new name
+        cfg.save(&p).unwrap();
+        let text = fs::read_to_string(&p).unwrap();
+        assert!(text.contains("vol_m_window_seconds") && !text.contains("delta_window_seconds"));
+        fs::remove_file(&p).unwrap();
+    }
+
+    #[test]
+    fn vol_m_window_is_clamped_to_30() {
+        let mut cfg = Config { vol_m_window_seconds: 5, ..Config::default() };
+        cfg.validate();
+        assert_eq!(cfg.vol_m_window_seconds, 30);
     }
 
     #[test]

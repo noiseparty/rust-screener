@@ -16,7 +16,12 @@ pub struct Ticker {
     pub market_value: f64,
     /// Previous close, derived from price and change ratio; basis for locally computed change %.
     pub prev_close: f64,
-    pub vol_delta: i64,
+    /// Shares per minute over the Vol/m window; `None` while there is too little history.
+    pub vol_rate: Option<f64>,
+    /// The Vol/m window is not yet fully covered by history.
+    pub vol_partial: bool,
+    /// The feed is silent, so `vol_rate` is not shown.
+    pub vol_stale: bool,
     pub rank_change: i32,
     pub status: String,
 }

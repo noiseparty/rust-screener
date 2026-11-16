@@ -392,11 +392,12 @@ fn cell(t: &Ticker, key: &str) -> Cell<'static> {
             Line::from(if t.market_value == 0.0 { "N/A".into() } else { compact(t.market_value) })
                 .alignment(Alignment::Right),
         ),
-        "delta" => {
-            let (s, c) = match t.vol_delta {
-                0 => ("0".to_string(), FAINT),
-                d if d > 0 => (format!("+{}", compact(d as f64)), CYAN),
-                d => (compact(d as f64), RED),
+        "volrate" => {
+            let (s, c) = match t.vol_rate {
+                _ if t.vol_stale => ("—".to_string(), DIM),
+                None => ("…".to_string(), FAINT),
+                Some(r) if r < 0.5 => ("0".to_string(), FAINT),
+                Some(r) => (compact(r), if t.vol_partial { DIM } else { CYAN }),
             };
             Cell::from(Line::from(Span::styled(s, Style::new().fg(c))).alignment(Alignment::Right))
         }
@@ -408,13 +409,18 @@ fn cell(t: &Ticker, key: &str) -> Cell<'static> {
     }
 }
 
+/// Column header for the Vol/m window: 30s, 1m, 3m, 90s.
+fn vol_m_header(secs: u64) -> String {
+    if secs >= 60 && secs % 60 == 0 { format!("Vol/m {}m", secs / 60) } else { format!("Vol/m {secs}s") }
+}
+
 fn gainers_table(f: &mut Frame, app: &mut App, area: Rect) {
     fit_columns(app, area.width.saturating_sub(4));
-    let delta_secs = app.cfg.delta_window_seconds;
+    let vol_m_label = vol_m_header(app.cfg.vol_m_window_seconds);
 
     let header = Row::new(app.visible_cols.iter().enumerate().map(|(vi, &ci)| {
         let col = &COLUMNS[ci];
-        let mut label = if col.key == "delta" { format!("Δ{delta_secs}s") } else { col.title.to_string() };
+        let mut label = if col.key == "volrate" { vol_m_label.clone() } else { col.title.to_string() };
         if app.sort_key == col.key {
             label.push(if app.sort_desc { '▼' } else { '▲' });
         }

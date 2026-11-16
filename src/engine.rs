@@ -13,6 +13,8 @@ pub const MAX_CANDLES: usize = 390;
 pub const LIVE_FRESH: Duration = Duration::from_secs(15);
 /// Assumed stream subscription cap (to be confirmed by the probe); members come first.
 pub const MAX_SUBS: usize = 100;
+/// Shortest Vol/m window, and the least history a rate needs.
+pub const MIN_VOL_M_WINDOW_SECS: u64 = 30;
 /// Series history kept beyond the longest window a consumer looks back over.
 const SERIES_MARGIN: Duration = Duration::from_secs(60);
 pub const RATE_WINDOWS: [(&str, u64); 4] = [("20m", 1200), ("5m", 300), ("1m", 60), ("30s", 30)];
@@ -137,7 +139,7 @@ pub struct Thresholds {
     pub min_price_for_alert: f64,
     pub baseline_window: Duration,
     pub rank_interval: Duration,
-    pub delta_window: Duration,
+    pub vol_m_window: Duration,
     pub max_alerts: usize,
 }
 
@@ -150,7 +152,7 @@ impl Thresholds {
             min_price_for_alert: c.min_price_for_alert,
             baseline_window: Duration::from_secs(c.baseline_window_sec),
             rank_interval: Duration::from_secs(c.rank_tracking_interval_seconds),
-            delta_window: Duration::from_secs(c.delta_window_seconds),
+            vol_m_window: Duration::from_secs(c.vol_m_window_seconds.max(MIN_VOL_M_WINDOW_SECS)),
             max_alerts: c.alert_history_max,
         }
     }
@@ -191,6 +193,8 @@ pub struct Engine {
     series: SeriesStore,
     /// Whether REST rows may write to the series (false while the stream is healthy).
     rest_feeds_series: bool,
+    /// No fresh data is arriving (stream silent and REST not answering): Vol/m shows a dash.
+    feed_stale: bool,
 }
 
 impl Engine {
@@ -212,11 +216,12 @@ impl Engine {
             index: HashMap::new(),
             series: SeriesStore::new(series_horizon(&Thresholds::from_config(cfg))),
             rest_feeds_series: true,
+            feed_stale: false,
         }
     }
 
     /// Receive-time series of every listed (or lingering) ticker, keyed by tickerId.
-    #[allow(dead_code)] // read by Vol/m, SETUP and probe mode (later steps)
+    #[allow(dead_code)] // read by SETUP (step 13)
     pub fn series(&self) -> &SeriesStore {
         &self.series
     }
@@ -224,6 +229,20 @@ impl Engine {
     /// The stream reconnected: everything it delivered before is stale.
     pub fn on_stream_reconnect(&mut self) {
         self.series.clear_all();
+        self.refresh_vol_rates(Instant::now());
+    }
+
+    /// Whether the data feed is silent; Vol/m shows a dash while it is.
+    pub fn set_feed_stale(&mut self, stale: bool) {
+        self.feed_stale = stale;
+    }
+
+    /// Recomputes Vol/m of every row at `now`: a quiet ticker decays, a cleared series blanks.
+    pub fn refresh_vol_rates(&mut self, now: Instant) {
+        for t in &mut self.latest {
+            (t.vol_rate, t.vol_partial, t.vol_stale) =
+                vol_m(&self.series, t.ticker_id, now, self.th.vol_m_window, self.feed_stale);
+        }
     }
 
     /// REST rows write to the series only while the stream is not healthy; otherwise the
@@ -270,13 +289,12 @@ impl Engine {
                 Ingest::Stored => {}
             }
             let vol = vol as i64;
+            let rate = vol_m(&self.series, u.id, now, self.th.vol_m_window, self.feed_stale);
             self.live.insert(u.id, Live { price: px, volume: vol, at: now });
             let Some(&i) = self.index.get(&u.id) else { continue };
             let t = &mut self.latest[i];
-            if vol > t.volume {
-                t.vol_delta += vol - t.volume;
-            }
             t.price = px;
+            (t.vol_rate, t.vol_partial, t.vol_stale) = rate;
             t.volume = vol;
             t.change_ratio = change_from(t.prev_close, px).or(u.change_ratio).unwrap_or(t.change_ratio);
             if let Some(m) = u.mcap.filter(|m| *m > 0.0) {
@@ -398,13 +416,13 @@ impl Engine {
             let is_bl = self.blacklist.contains(&t.symbol);
             let shown = is_bl || self.filters.matches(&t);
 
+            (t.vol_rate, t.vol_partial, t.vol_stale) =
+                vol_m(&self.series, t.ticker_id, now, th.vol_m_window, self.feed_stale);
+
             let vh = self.vol_hist.entry(t.symbol.clone()).or_default();
-            if let Some(base) = baseline(vh, now, th.delta_window) {
-                t.vol_delta = t.volume - base;
-            }
             let base_vol = baseline(vh, now, th.baseline_window);
             vh.push((now, t.volume));
-            prune(vh, now, th.delta_window.max(th.baseline_window));
+            prune(vh, now, th.baseline_window);
 
             let ph = self.price_hist.entry(t.symbol.clone()).or_default();
             let base_price = baseline(ph, now, th.baseline_window);
@@ -467,18 +485,12 @@ impl Engine {
         // rank_change is derived from rank order, so Mov cannot be ranked by itself:
         // rank by change, then reorder by the computed movement.
         let (rank_key, rank_desc) = if sort_key == "mov" { ("change", true) } else { (sort_key, sort_desc) };
-        active.sort_by(|a, b| {
-            let o = compare(a, b, rank_key);
-            if rank_desc { o.reverse() } else { o }
-        });
+        active.sort_by(|a, b| ordered(a, b, rank_key, rank_desc));
         active.truncate(MAX_ROWS);
 
         self.track_ranks(&mut active, rank_key, rank_desc, now);
         if sort_key == "mov" {
-            active.sort_by(|a, b| {
-                let o = compare(a, b, sort_key);
-                if sort_desc { o.reverse() } else { o }
-            });
+            active.sort_by(|a, b| ordered(a, b, sort_key, sort_desc));
         }
 
         while self.alerts.len() > th.max_alerts {
@@ -512,16 +524,10 @@ impl Engine {
         }
         let rank_key = if sort_key == "mov" { "change" } else { sort_key };
         let rank_desc = sort_key == "mov" || sort_desc;
-        active.sort_by(|a, b| {
-            let o = compare(a, b, rank_key);
-            if rank_desc { o.reverse() } else { o }
-        });
+        active.sort_by(|a, b| ordered(a, b, rank_key, rank_desc));
         active.truncate(MAX_ROWS);
         if sort_key == "mov" {
-            active.sort_by(|a, b| {
-                let o = compare(a, b, sort_key);
-                if sort_desc { o.reverse() } else { o }
-            });
+            active.sort_by(|a, b| ordered(a, b, sort_key, sort_desc));
         }
         Output { active, blacklisted, new_alerts: 0 }
     }
@@ -548,7 +554,29 @@ impl Engine {
 
 /// Series history to keep: the longest look-back window plus a margin.
 fn series_horizon(th: &Thresholds) -> Duration {
-    th.delta_window.max(th.baseline_window) + SERIES_MARGIN
+    th.vol_m_window.max(th.baseline_window) + SERIES_MARGIN
+}
+
+/// Vol/m of one ticker at `now`: (shares per minute, window only partly covered, feed stale).
+///
+/// The window ends at `now` and starts at `now - window`, or at the first point if the series is
+/// younger. Under 30 s of coverage, or no series, gives no rate; a stale feed hides it.
+fn vol_m(series: &SeriesStore, id: u64, now: Instant, window: Duration, stale: bool) -> (Option<f64>, bool, bool) {
+    if stale {
+        return (None, false, true);
+    }
+    let window = window.max(Duration::from_secs(MIN_VOL_M_WINDOW_SECS));
+    let Some(first) = series.oldest(id) else { return (None, false, false) };
+    let start = now.checked_sub(window).map_or(first.t, |s| s.max(first.t));
+    let covered = now.saturating_duration_since(start);
+    if covered < Duration::from_secs(MIN_VOL_M_WINDOW_SECS) {
+        return (None, false, false);
+    }
+    let (Some(end), Some(begin)) = (series.vol_at(id, now), series.vol_at(id, start)) else {
+        return (None, false, false);
+    };
+    let rate = end.saturating_sub(begin) as f64 * 60.0 / covered.as_secs_f64();
+    (Some(rate), covered < window, false)
 }
 
 /// Change ratio versus the previous close, when that is known.
@@ -572,6 +600,20 @@ fn prune<T>(hist: &mut Vec<(Instant, T)>, now: Instant, window: Duration) {
     hist.drain(..keep_from);
 }
 
+/// Sort order for `key`. Rows without a Vol/m rate go last in both directions.
+fn ordered(a: &Ticker, b: &Ticker, key: &str, desc: bool) -> Ordering {
+    if key == "volrate" {
+        match (a.vol_rate, b.vol_rate) {
+            (None, Some(_)) => return Ordering::Greater,
+            (Some(_), None) => return Ordering::Less,
+            (None, None) => return a.symbol.cmp(&b.symbol),
+            _ => {}
+        }
+    }
+    let o = compare(a, b, key);
+    if desc { o.reverse() } else { o }
+}
+
 pub fn compare(a: &Ticker, b: &Ticker, key: &str) -> Ordering {
     let f = |x: f64, y: f64| x.partial_cmp(&y).unwrap_or(Ordering::Equal);
     let primary = match key {
@@ -581,9 +623,9 @@ pub fn compare(a: &Ticker, b: &Ticker, key: &str) -> Ordering {
         "change" => f(a.change_ratio, b.change_ratio),
         "volume" => a.volume.cmp(&b.volume),
         "mcap" => f(a.market_value, b.market_value),
-        "delta" => a.vol_delta.cmp(&b.vol_delta),
+        "volrate" => f(a.vol_rate.unwrap_or(0.0), b.vol_rate.unwrap_or(0.0)),
         "status" => a.status.cmp(&b.status),
-        _ => f(a.change_ratio, b.change_ratio).then(a.vol_delta.cmp(&b.vol_delta)),
+        _ => f(a.change_ratio, b.change_ratio).then(a.volume.cmp(&b.volume)),
     };
     primary.then_with(|| a.symbol.cmp(&b.symbol))
 }
@@ -630,7 +672,6 @@ mod tests {
         let out = e.process(vec![tk("A", 1.2, 3000, 0.3, 0.0)], "change", true, t0 + Duration::from_secs(5));
         assert_eq!(out.active[0].status, "SETUP");
         assert_eq!(e.alerts().back().unwrap().kind, AlertKind::Setup);
-        assert_eq!(out.active[0].vol_delta, 2000);
     }
 
     #[test]
@@ -649,22 +690,160 @@ mod tests {
         assert_eq!(e.tick_rates(t0 + Duration::from_secs(6))[3], (0, 1));
     }
 
-    #[test]
-    fn delta_uses_delta_window() {
+    /// Engine whose REST rows (ticker 1) feed the series; Vol/m window `w` seconds.
+    fn vol_engine(w: u64) -> Engine {
         let mut cfg = Config::default();
         cfg.max_market_cap = 0.0;
-        cfg.delta_window_seconds = 10;
-        let mut e = Engine::new(&cfg);
-        let t0 = Instant::now();
-        for (i, v) in [100, 200, 300, 400].iter().enumerate() {
-            let out = e.process(vec![tk("A", 1.0, *v, 0.1, 0.0)], "change", true, t0 + Duration::from_secs(i as u64 * 5));
-            if i == 3 {
-                // window [5s, 15s] -> oldest sample in window is 200
-                assert_eq!(out.active[0].vol_delta, 200);
-            }
-        }
+        cfg.vol_m_window_seconds = w;
+        Engine::new(&cfg)
     }
 
+    fn feed(e: &mut Engine, t0: Instant, secs: u64, vol: i64) {
+        let t = Ticker { ticker_id: 1, ..tk("A", 1.0, vol, 0.1, 0.0) };
+        e.process(vec![t], "change", true, t0 + Duration::from_secs(secs));
+    }
+
+    fn row(e: &Engine) -> Ticker {
+        e.reapply("change", true).active.remove(0)
+    }
+
+    #[test]
+    fn vol_m_over_a_full_window() {
+        let mut e = vol_engine(180);
+        let t0 = Instant::now();
+        // 50 shares per second
+        for i in 0..=20u64 {
+            feed(&mut e, t0, i * 10, 1000 + 500 * i as i64);
+        }
+        let t = row(&e);
+        assert_eq!((t.vol_rate, t.vol_partial, t.vol_stale), (Some(3000.0), false, false));
+    }
+
+    #[test]
+    fn vol_m_is_partial_until_the_window_is_covered() {
+        let mut e = vol_engine(180);
+        let t0 = Instant::now();
+        for i in 0..=6u64 {
+            feed(&mut e, t0, i * 10, 1000 + 500 * i as i64);
+        }
+        let t = row(&e);
+        assert_eq!((t.vol_rate, t.vol_partial), (Some(3000.0), true));
+    }
+
+    #[test]
+    fn vol_m_needs_30_seconds_of_history() {
+        let mut e = vol_engine(180);
+        let t0 = Instant::now();
+        feed(&mut e, t0, 0, 1000);
+        assert_eq!(row(&e).vol_rate, None);
+        feed(&mut e, t0, 29, 5000);
+        assert_eq!(row(&e).vol_rate, None);
+        feed(&mut e, t0, 30, 5000);
+        assert!(row(&e).vol_rate.is_some());
+        // a ticker without a tickerId has no series
+        let mut e = vol_engine(180);
+        e.process(vec![tk("B", 1.0, 1000, 0.1, 0.0)], "change", true, t0);
+        e.process(vec![tk("B", 1.0, 9000, 0.1, 0.0)], "change", true, t0 + Duration::from_secs(60));
+        assert_eq!(row(&e).vol_rate, None);
+    }
+
+    #[test]
+    fn vol_m_of_a_quiet_ticker_decays_to_zero() {
+        let mut e = vol_engine(180);
+        let t0 = Instant::now();
+        for i in 0..=6u64 {
+            feed(&mut e, t0, i * 10, 1000 + 500 * i as i64);
+        }
+        // 60 s later the burst is still inside the window: 3000 shares over 120 s
+        e.refresh_vol_rates(t0 + Duration::from_secs(120));
+        let t = row(&e);
+        assert_eq!((t.vol_rate, t.vol_partial), (Some(1500.0), true));
+        // once the window has moved past the burst the rate is a true 0
+        e.refresh_vol_rates(t0 + Duration::from_secs(300));
+        let t = row(&e);
+        assert_eq!((t.vol_rate, t.vol_partial), (Some(0.0), false));
+    }
+
+    #[test]
+    fn vol_m_is_hidden_while_the_feed_is_stale() {
+        let mut e = vol_engine(180);
+        let t0 = Instant::now();
+        for i in 0..=6u64 {
+            feed(&mut e, t0, i * 10, 1000 + 500 * i as i64);
+        }
+        e.set_feed_stale(true);
+        e.refresh_vol_rates(t0 + Duration::from_secs(61));
+        let t = row(&e);
+        assert_eq!((t.vol_rate, t.vol_stale), (None, true));
+        e.set_feed_stale(false);
+        e.refresh_vol_rates(t0 + Duration::from_secs(61));
+        let t = row(&e);
+        assert_eq!((t.vol_rate.is_some(), t.vol_stale), (true, false));
+    }
+
+    #[test]
+    fn vol_m_blanks_when_the_series_is_cleared() {
+        let mut e = vol_engine(180);
+        let t0 = Instant::now();
+        for i in 0..=6u64 {
+            feed(&mut e, t0, i * 10, 1000 + 500 * i as i64);
+        }
+        assert!(row(&e).vol_rate.is_some());
+        e.on_stream_reconnect();
+        let t = row(&e);
+        assert_eq!((t.vol_rate, t.vol_stale), (None, false));
+    }
+
+    #[test]
+    fn vol_m_window_follows_config_and_is_clamped() {
+        let mut e = vol_engine(60);
+        let t0 = Instant::now();
+        // 60 shares per second for 120 s, then 0 for 60 s
+        for i in 0..=12u64 {
+            feed(&mut e, t0, i * 10, 1000 + 600 * i as i64);
+        }
+        for i in 13..=18u64 {
+            feed(&mut e, t0, i * 10, 1000 + 600 * 12);
+        }
+        assert_eq!(row(&e).vol_rate, Some(0.0));
+        let mut cfg = Config::default();
+        cfg.max_market_cap = 0.0;
+        cfg.vol_m_window_seconds = 120;
+        e.apply_config(&cfg);
+        e.refresh_vol_rates(t0 + Duration::from_secs(180));
+        assert_eq!(row(&e).vol_rate, Some(1800.0));
+        // below the minimum the window is 30 s
+        assert_eq!(Thresholds::from_config(&Config { vol_m_window_seconds: 5, ..Config::default() }).vol_m_window.as_secs(), 30);
+    }
+
+    #[test]
+    fn vol_m_from_stream_quotes() {
+        let (mut e, t0) = live_engine();
+        e.set_rest_feeds_series(false);
+        let mut u = upd(7, 1000, 1, 1.5, 2000);
+        u.recv = t0 + Duration::from_secs(10);
+        e.apply_quotes(&[u], Session::Reg, t0 + Duration::from_secs(10));
+        // one point only: nothing to measure yet
+        assert_eq!(row(&e).vol_rate, None);
+        let mut u = upd(7, 2000, 1, 1.6, 8000);
+        u.recv = t0 + Duration::from_secs(70);
+        e.apply_quotes(&[u], Session::Reg, t0 + Duration::from_secs(70));
+        let t = row(&e);
+        assert_eq!((t.vol_rate, t.vol_partial), (Some(6000.0), true));
+    }
+
+    #[test]
+    fn vol_rate_sorts_with_blanks_last_in_both_directions() {
+        let r = |s: &str, v: Option<f64>| Ticker { vol_rate: v, ..tk(s, 1.0, 1, 0.1, 0.0) };
+        let rows = vec![r("N1", None), r("LOW", Some(10.0)), r("ZERO", Some(0.0)), r("HIGH", Some(500.0)), r("N2", None)];
+        let sorted = |desc: bool| {
+            let mut v = rows.clone();
+            v.sort_by(|a, b| ordered(a, b, "volrate", desc));
+            v.into_iter().map(|t| t.symbol).collect::<Vec<_>>()
+        };
+        assert_eq!(sorted(true), ["HIGH", "LOW", "ZERO", "N1", "N2"]);
+        assert_eq!(sorted(false), ["ZERO", "LOW", "HIGH", "N1", "N2"]);
+    }
     #[test]
     fn filtered_and_blacklisted_split() {
         let mut cfg = Config::default();
@@ -812,7 +991,8 @@ mod tests {
         let t = &e.reapply("change", true).active[0];
         assert_eq!((t.price, t.volume), (1.5, 1600));
         assert!((t.change_ratio - 0.5).abs() < 1e-9);
-        assert_eq!(t.vol_delta, 600);
+        // 5 s of history is too little for Vol/m
+        assert_eq!(t.vol_rate, None);
         // unknown ids and ids without volume change nothing
         assert!(!e.apply_quotes(&[upd(99, 1, 1, 1.0, 1)], Session::Reg, t0));
         let mut nov = upd(7, 2000, 1, 2.0, 0);
@@ -993,7 +1173,7 @@ mod tests {
     fn config_change_updates_series_horizon() {
         let mut cfg = Config::default();
         cfg.max_market_cap = 0.0;
-        cfg.delta_window_seconds = 30;
+        cfg.vol_m_window_seconds = 30;
         cfg.baseline_window_sec = 30;
         let mut e = Engine::new(&cfg);
         let t0 = Instant::now();
