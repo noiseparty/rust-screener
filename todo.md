@@ -13,10 +13,10 @@ Status as of 2026-11-16. Spec: `docs/plan.md` (user decisions, authoritative) an
 - [x] 7. App home dir (`5fc469a`)
 - [x] 8. Stream client (`0d056c3`)
 - [x] 9. Series store (`c8163e9`)
+- [x] 10. Probe mode (`1b27d6f`)
 
 ## Unfinished: build steps in order
 
-- [ ] 10. **Probe mode** (item 7): `volume_screener.exe --probe` headless recorder → `probe\probe-YYYY-MM-DD.csv`.
 - [ ] 11. **Vol/m column** (item 9): replaces Δ volume column.
 - [ ] 12. **Ranking** (items 17, 18, 19): recompute tick 500/1000 ms (setting), Mov = rank change on the full board by % change (cyan `+` for new entrants), filter grace: dimmed 60 s then hidden.
 - [ ] 13. **SETUP** (item 13): user's proven logic (vol ratio + price % vs N seconds ago), all three adjustable (defaults 300 s / 2.2x / +10%), config key migration, hide SPIKE and PUMP.
