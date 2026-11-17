@@ -8,7 +8,8 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 pub const MAX_ROWS: usize = 100;
-pub const MAX_CANDLES: usize = 390;
+/// 1-minute candles kept in memory per ticker (about two full extended-hours sessions).
+pub const MAX_CANDLES: usize = 2000;
 /// A stream quote older than this no longer overrides the REST row.
 pub const LIVE_FRESH: Duration = Duration::from_secs(15);
 /// Assumed stream subscription cap (to be confirmed by the probe); members come first.
@@ -25,7 +26,6 @@ pub const BADGE_HOLD: Duration = Duration::from_secs(60);
 pub const NEW_QUIET: Duration = Duration::from_secs(1800);
 /// How long a symbol's last time on the list is remembered.
 const LISTED_KEEP: Duration = Duration::from_secs(2400);
-pub const RATE_WINDOWS: [(&str, u64); 4] = [("20m", 1200), ("5m", 300), ("1m", 60), ("30s", 30)];
 /// Badge priority when several alert kinds of one symbol are held: first wins.
 const BADGE_PRIORITY: [AlertKind; 4] = [AlertKind::Setup, AlertKind::Pump, AlertKind::Spike, AlertKind::New];
 
@@ -69,7 +69,8 @@ impl AlertKind {
 #[derive(Debug, Clone)]
 pub struct Alert {
     pub at: Instant,
-    pub clock: String,
+    /// Wall-clock time it fired (epoch seconds), shown in the chosen time format.
+    pub epoch: i64,
     pub symbol: String,
     pub kind: AlertKind,
     pub prev_vol: i64,
@@ -93,12 +94,15 @@ impl Alert {
             AlertKind::New => "appeared".into(),
             AlertKind::Spike => format!("vol {:.1}x", self.vol_ratio()),
             AlertKind::Pump => format!("price +{:.1}%", self.price_pct()),
+            // a previous window without trades has no ratio
+            AlertKind::Setup if self.prev_vol == 0 => format!("vol from 0  +{:.1}%", self.price_pct()),
             AlertKind::Setup => format!("vol {:.1}x  +{:.1}%", self.vol_ratio(), self.price_pct()),
         }
     }
 }
 
-/// Display filters. A zero bound means "no bound".
+/// Display filters. A zero bound means "no bound". An unknown float or share count (0) passes
+/// its bounds, so a ticker is not hidden before its float is fetched.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Filters {
     pub min_mcap: f64,
@@ -109,6 +113,10 @@ pub struct Filters {
     pub max_volume: i64,
     pub min_price: f64,
     pub max_price: f64,
+    pub min_float: f64,
+    pub max_float: f64,
+    pub min_shares: f64,
+    pub max_shares: f64,
 }
 
 impl Filters {
@@ -122,6 +130,10 @@ impl Filters {
             max_volume: c.max_volume,
             min_price: c.min_price,
             max_price: c.max_price,
+            min_float: c.min_float,
+            max_float: c.max_float,
+            min_shares: c.min_shares,
+            max_shares: c.max_shares,
         }
     }
 
@@ -135,6 +147,10 @@ impl Filters {
             {
                 return false;
             }
+        }
+        let outside = |v: f64, min: f64, max: f64| v > 0.0 && ((min > 0.0 && v < min) || (max > 0.0 && v > max));
+        if outside(t.float, self.min_float, self.max_float) || outside(t.total_shares, self.min_shares, self.max_shares) {
+            return false;
         }
         let pct = t.change_ratio * 100.0;
         !((self.min_price > 0.0 && t.price < self.min_price)
@@ -192,97 +208,11 @@ struct Live {
     at: Instant,
 }
 
-/// After (re)seeding, a ticker raises no new-high/low event for this long.
-const HL_ARM: Duration = Duration::from_secs(60);
-/// Least time between two events of one ticker.
-const HL_GAP: Duration = Duration::from_secs(1);
-
-/// Session high and low seen for one ticker.
-#[derive(Debug, Clone, Copy)]
-struct Extremes {
-    hi: f64,
-    lo: f64,
-    armed_at: Instant,
-    last_event: Option<Instant>,
-}
-
-/// Session new-high / new-low events across the board (design 2.8). A ticker's first quote of a
-/// session (or after a series clear) only sets its high and low; a new extreme after the arming
-/// delay is one event, at most one per second per ticker.
-#[derive(Debug, Default)]
-struct HighLow {
-    session: Option<Session>,
-    resets: u64,
-    map: HashMap<u64, Extremes>,
-    /// (time, is_high), oldest first. Kept across session changes so the windows decay by themselves.
-    events: VecDeque<(Instant, bool)>,
-}
-
-impl HighLow {
-    /// Starts over when the session changed or the series store was cleared since the last
-    /// quote: every ticker seeds again. Events stay and decay out of the windows.
-    fn sync(&mut self, session: Session, resets: u64) {
-        if self.session != Some(session) || self.resets != resets {
-            self.map.clear();
-            self.session = Some(session);
-            self.resets = resets;
-        }
-    }
-
-    /// `day_hi`/`day_lo`: the stream's day high/low, given only in the regular session.
-    fn quote(&mut self, id: u64, px: f64, day_hi: Option<f64>, day_lo: Option<f64>, now: Instant) {
-        if !(px > 0.0) {
-            return;
-        }
-        let h = day_hi.map_or(px, |d| px.max(d));
-        let l = day_lo.map_or(px, |d| px.min(d));
-        let Some(e) = self.map.get_mut(&id) else {
-            self.map.insert(id, Extremes { hi: h, lo: l, armed_at: now + HL_ARM, last_event: None });
-            return;
-        };
-        let is_high = if h > e.hi {
-            e.hi = h;
-            true
-        } else if l < e.lo {
-            e.lo = l;
-            false
-        } else {
-            return;
-        };
-        if now >= e.armed_at && e.last_event.is_none_or(|t| now.saturating_duration_since(t) >= HL_GAP) {
-            e.last_event = Some(now);
-            self.events.push_back((now, is_high));
-            self.prune(now);
-        }
-    }
-
-    /// Drops events the longest window no longer counts.
-    fn prune(&mut self, now: Instant) {
-        let horizon = Duration::from_secs(RATE_WINDOWS[0].1);
-        while self.events.front().is_some_and(|(at, _)| now.saturating_duration_since(*at) >= horizon) {
-            self.events.pop_front();
-        }
-    }
-
-    /// (highs, lows) per window, ordered as RATE_WINDOWS. An event exactly as old as the window is out.
-    fn counts(&self, now: Instant) -> [(u32, u32); 4] {
-        let mut out = [(0u32, 0u32); 4];
-        for (i, &(_, secs)) in RATE_WINDOWS.iter().enumerate() {
-            let w = Duration::from_secs(secs);
-            let start = self.events.partition_point(|(at, _)| now.saturating_duration_since(*at) >= w);
-            for &(_, is_high) in self.events.range(start..) {
-                if is_high { out[i].0 += 1 } else { out[i].1 += 1 }
-            }
-        }
-        out
-    }
-}
 
 pub struct Engine {
     pub filters: Filters,
     pub th: Thresholds,
     pub blacklist: BTreeSet<String>,
-    last: HashMap<String, Ticker>,
     /// Every ticker from the most recent process() call, for local re-filter/re-sort.
     latest: Vec<Ticker>,
     /// Full-board order by % change (every listed symbol, blacklisted included), pushed
@@ -301,10 +231,6 @@ pub struct Engine {
     /// When each alert kind (by `AlertKind::slot`) last fired for a symbol. Drives the cooldown
     /// and the Status badge; entries older than the badge hold are dropped.
     fired: HashMap<String, [Option<Instant>; 4]>,
-    /// Price tick direction events across the board: (time, is_up).
-    ticks: VecDeque<(Instant, bool)>,
-    /// New-high / new-low tracking (design 2.8), fed by stream quotes only.
-    hl: HighLow,
     candles: HashMap<String, VecDeque<Candle>>,
     /// Start of the newest candle per symbol already handed to storage (or loaded from it).
     stored_upto: HashMap<String, i64>,
@@ -325,7 +251,6 @@ impl Engine {
             filters: Filters::from_config(cfg),
             th: Thresholds::from_config(cfg),
             blacklist: cfg.blacklisted_tickers.iter().cloned().collect(),
-            last: HashMap::new(),
             latest: Vec::new(),
             rank_ring: VecDeque::new(),
             passing: HashSet::new(),
@@ -334,8 +259,6 @@ impl Engine {
             listed: HashMap::new(),
             reseed: true,
             fired: HashMap::new(),
-            ticks: VecDeque::new(),
-            hl: HighLow::default(),
             candles: HashMap::new(),
             stored_upto: HashMap::new(),
             last_cum_vol: HashMap::new(),
@@ -358,13 +281,22 @@ impl Engine {
         self.refresh_vol_rates(Instant::now());
     }
 
-    /// Cumulative volume and price of `id` as they were `setup_window` before `now`, from the
-    /// series store. History shorter than the window falls back to the oldest sample.
-    /// `None` when the series is empty or cleared.
-    fn setup_base(&self, id: u64, now: Instant) -> Option<(u64, f64)> {
+    /// SETUP baseline of `id` at `now` with cumulative volume `vol`, from the series store:
+    /// the volume traded in the last `setup_window`, in the window before it, and the price one
+    /// window ago. A previous window only partly covered (history shorter than two windows) is
+    /// scaled to a full window; `None` when less than a tenth of it is covered, or no series.
+    fn setup_base(&self, id: u64, now: Instant, vol: i64) -> Option<SetupBase> {
+        let w = self.th.setup_window;
         let first = self.series().oldest(id)?;
-        let at = now.checked_sub(self.th.setup_window).map_or(first.t, |s| s.max(first.t));
-        Some((self.series().vol_at(id, at)?, self.series().px_at(id, at)?))
+        let mid = now.checked_sub(w)?;
+        let from = mid.checked_sub(w).map_or(first.t, |s| s.max(first.t));
+        let covered = mid.checked_duration_since(from)?;
+        if covered.is_zero() || covered < w / 10 {
+            return None;
+        }
+        let (mid_vol, from_vol) = (self.series().vol_at(id, mid)?, self.series().vol_at(id, from)?);
+        let prev = mid_vol.saturating_sub(from_vol) as f64 * w.as_secs_f64() / covered.as_secs_f64();
+        Some(SetupBase { prev: prev.round() as u64, cur: (vol.max(0) as u64).saturating_sub(mid_vol), px: self.series().px_at(id, mid)? })
     }
 
     /// Whether the data feed is silent; Vol/m shows a dash while it is.
@@ -415,8 +347,6 @@ impl Engine {
                 let obs = Obs { id: u.id, src: Source::Stream, ms: u.trade_ms, seq: u.seq, px: Some(px), vol: Some(vol), at: u.recv };
                 self.series.ingest(obs)
             });
-            // New highs/lows read every quote, in whatever order it arrives (no trdSeq guard).
-            self.track_high_low(u, px, session, now);
             let (Some(vol), Some(ingest)) = (u.volume, ingest) else { continue };
             match ingest {
                 Ingest::Dropped => continue,
@@ -466,20 +396,34 @@ impl Engine {
         self.candles.get(sym)
     }
 
-    /// Seeds the in-memory candles from storage (start of run) and marks them as stored.
-    /// Rows are taken in file order; the last `MAX_CANDLES` per symbol are kept.
-    pub fn load_candles(&mut self, rows: Vec<(String, Candle)>) {
-        for (sym, c) in rows {
-            let bars = self.candles.entry(sym.clone()).or_default();
-            if bars.back().is_some_and(|b| b.start >= c.start) {
-                continue;
+    /// Start of the first candle held for `sym`.
+    pub fn first_candle_start(&self, sym: &str) -> Option<i64> {
+        self.candles.get(sym)?.front().map(|c| c.start)
+    }
+
+    /// Puts backfilled or saved bars among the held candles, in order of start, before, between
+    /// or after them. A minute already held is kept (our own candles are never replaced); past
+    /// `MAX_CANDLES` the oldest go. Returns the bars taken and still held, oldest first.
+    pub fn insert_candles(&mut self, sym: &str, bars: &[Candle]) -> Vec<Candle> {
+        let held = self.candles.entry(sym.to_string()).or_default();
+        let mut added = Vec::new();
+        for c in bars {
+            if let Err(i) = held.binary_search_by_key(&c.start, |h| h.start) {
+                held.insert(i, *c);
+                added.push(*c);
             }
-            bars.push_back(c);
-            if bars.len() > MAX_CANDLES {
-                bars.pop_front();
-            }
-            self.stored_upto.insert(sym, c.start);
         }
+        let extra = held.len().saturating_sub(MAX_CANDLES);
+        held.drain(..extra);
+        let first = held.front().map_or(i64::MAX, |c| c.start);
+        added.retain(|c| c.start >= first);
+        added.sort_by_key(|c| c.start);
+        added
+    }
+
+    /// Start of the newest candle of `sym` written to storage.
+    pub fn stored_upto(&self, sym: &str) -> Option<i64> {
+        self.stored_upto.get(sym).copied()
     }
 
     /// Candles whose minute has ended by `now_epoch` and that are not stored yet, oldest first
@@ -571,45 +515,15 @@ impl Engine {
         &self.alerts
     }
 
+    /// Sets the float and total shares of every row from the float cache.
+    pub fn set_floats(&mut self, floats: &HashMap<u64, crate::scraper::Float>) {
+        crate::scraper::fill_floats(&mut self.latest, floats);
+    }
+
     pub fn toggle_blacklist(&mut self, sym: &str) {
         if !self.blacklist.remove(sym) {
             self.blacklist.insert(sym.to_string());
         }
-    }
-
-    /// One stream quote into the new-high/new-low tracker. Blacklisted and unlisted tickers are
-    /// ignored; a session change or a series clear (`resets()`) restarts the per-ticker extremes.
-    fn track_high_low(&mut self, u: &Update, px: f64, session: Session, now: Instant) {
-        if session == Session::Closed {
-            return;
-        }
-        let Some(&i) = self.index.get(&u.id) else { return };
-        if self.blacklist.contains(&self.latest[i].symbol) {
-            return;
-        }
-        self.hl.sync(session, self.series.resets());
-        // The stream's day high/low only mean something in the regular session.
-        let reg = |v: Option<f64>| v.filter(|v| session == Session::Reg && *v > 0.0);
-        self.hl.quote(u.id, px, reg(u.high), reg(u.low), now);
-    }
-
-    /// New highs / new lows per rate window as (highs, lows), ordered as RATE_WINDOWS.
-    pub fn high_low_counts(&self, now: Instant) -> [(u32, u32); 4] {
-        self.hl.counts(now)
-    }
-
-    /// Down/up tick counts per rate window, ordered as RATE_WINDOWS.
-    pub fn tick_rates(&self, now: Instant) -> [(u32, u32); 4] {
-        let mut out = [(0u32, 0u32); 4];
-        for &(at, up) in &self.ticks {
-            let age = now.saturating_duration_since(at).as_secs();
-            for (i, &(_, secs)) in RATE_WINDOWS.iter().enumerate() {
-                if age < secs {
-                    if up { out[i].1 += 1 } else { out[i].0 += 1 }
-                }
-            }
-        }
-        out
     }
 
     pub fn process(&mut self, tickers: Vec<Ticker>, sort_key: &str, sort_desc: bool, now: Instant) -> Output {
@@ -637,29 +551,12 @@ impl Engine {
                     at: now,
                 });
             }
-            let is_bl = self.blacklist.contains(&t.symbol);
-            let shown = is_bl || self.filters.matches(&t);
-
             (t.vol_rate, t.vol_partial, t.vol_stale) =
                 vol_m(&self.series, t.ticker_id, now, th.vol_m_window, self.feed_stale);
 
             // NEW and SETUP are evaluated on the recompute tick.
-            if let Some(prev) = self.last.get(&t.symbol) {
-                if shown && t.price > prev.price {
-                    self.ticks.push_back((now, true));
-                } else if shown && t.price < prev.price {
-                    self.ticks.push_back((now, false));
-                }
-            }
-
             self.record_sample(&t.symbol, epoch, t.price, t.volume);
-            self.last.insert(t.symbol.clone(), t.clone());
             latest.push(t);
-        }
-
-        let horizon = Duration::from_secs(RATE_WINDOWS[0].1);
-        while self.ticks.front().is_some_and(|(at, _)| now.saturating_duration_since(*at) >= horizon) {
-            self.ticks.pop_front();
         }
 
         while self.alerts.len() > th.max_alerts {
@@ -687,7 +584,6 @@ impl Engine {
     /// `fetched`: the list was just replaced by a fetch (the first one after a reseed seeds NEW).
     fn recompute_at(&mut self, now: Instant, fetched: bool) -> usize {
         self.rank_board(now);
-        self.hl.prune(now);
         self.update_display(now);
         let raised = self.evaluate_new(now, fetched) + self.evaluate_setups(now);
         let hold = self.badge_hold();
@@ -725,11 +621,11 @@ impl Engine {
         }
         self.seed_listed(now);
         self.listed.retain(|_, at| now.saturating_duration_since(*at) < LISTED_KEEP);
-        let clock = chrono::Local::now().format("%H:%M:%S").to_string();
+        let epoch = chrono::Utc::now().timestamp();
         let mut raised = 0;
         for t in hits {
-            let base = self.setup_base(t.ticker_id, now);
-            if self.raise(AlertKind::New, &t, base, now, &clock) {
+            let base = self.setup_base(t.ticker_id, now, t.volume);
+            if self.raise(AlertKind::New, &t, base, now, epoch) {
                 raised += 1;
             }
         }
@@ -750,18 +646,18 @@ impl Engine {
             if !eligible || !self.shown(t) || !self.can_fire(&t.symbol, AlertKind::Setup, now) {
                 continue;
             }
-            let base = self.setup_base(t.ticker_id, now);
-            if setup_met(&th, base, t.volume, t.price) {
+            let base = self.setup_base(t.ticker_id, now, t.volume);
+            if setup_met(&th, base, t.price) {
                 hits.push((t.clone(), base));
             }
         }
         if hits.is_empty() {
             return 0;
         }
-        let clock = chrono::Local::now().format("%H:%M:%S").to_string();
+        let epoch = chrono::Utc::now().timestamp();
         let mut raised = 0;
         for (t, base) in hits {
-            if self.raise(AlertKind::Setup, &t, base, now, &clock) {
+            if self.raise(AlertKind::Setup, &t, base, now, epoch) {
                 raised += 1;
             }
         }
@@ -780,20 +676,21 @@ impl Engine {
     }
 
     /// Logs an alert unless the symbol is blacklisted or still cooling down for this kind, and
-    /// starts the cooldown and the Status badge. `base` is the value one SETUP window ago.
-    fn raise(&mut self, kind: AlertKind, t: &Ticker, base: Option<(u64, f64)>, now: Instant, clock: &str) -> bool {
+    /// starts the cooldown and the Status badge. `base` holds the volume of the previous and the
+    /// last SETUP window and the price one window ago.
+    fn raise(&mut self, kind: AlertKind, t: &Ticker, base: Option<SetupBase>, now: Instant, epoch: i64) -> bool {
         if self.blacklist.contains(&t.symbol) || !self.can_fire(&t.symbol, kind, now) {
             return false;
         }
         self.fired.entry(t.symbol.clone()).or_default()[kind.slot()] = Some(now);
         self.alerts.push_back(Alert {
             at: now,
-            clock: clock.to_string(),
+            epoch,
             symbol: t.symbol.clone(),
             kind,
-            prev_vol: base.map_or(-1, |b| b.0 as i64),
-            curr_vol: t.volume,
-            prev_price: base.map_or(-1.0, |b| b.1),
+            prev_vol: base.map_or(-1, |b| b.prev as i64),
+            curr_vol: base.map_or(t.volume, |b| b.cur as i64),
+            prev_price: base.map_or(-1.0, |b| b.px),
             curr_price: t.price,
             change_ratio: t.change_ratio,
         });
@@ -920,24 +817,34 @@ fn movements<'a>(old: Option<&[String]>, new: &'a [String], blacklist: &BTreeSet
         .collect()
 }
 
-/// Series history to keep: the longest look-back window (Vol/m or SETUP) plus a margin.
+/// Series history to keep: the longest look-back (Vol/m, or two SETUP windows) plus a margin.
 fn series_horizon(th: &Thresholds) -> Duration {
-    th.vol_m_window.max(th.setup_window) + SERIES_MARGIN
+    th.vol_m_window.max(th.setup_window * 2) + SERIES_MARGIN
 }
 
-/// SETUP: versus the value `setup_window` ago (`base`: cumulative volume, price), the volume ratio
-/// is at least `setup_vol_ratio` and the price change is at least `setup_price_pct` percent.
-/// Both limits are inclusive. No baseline, or a baseline of 0, never triggers.
-fn setup_met(th: &Thresholds, base: Option<(u64, f64)>, vol: i64, price: f64) -> bool {
+/// SETUP baseline: shares traded in the previous and in the last SETUP window, and the price
+/// one window ago.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SetupBase {
+    pub prev: u64,
+    pub cur: u64,
+    pub px: f64,
+}
+
+/// SETUP: the volume of the last `setup_window` is at least `setup_vol_ratio` times the volume
+/// of the window before it (after a window without trades any volume counts), and the price is
+/// up at least `setup_price_pct` percent on one window ago. Both limits are inclusive. Windows,
+/// not the day's total, so a ticker that spikes again later in the day still fires.
+fn setup_met(th: &Thresholds, base: Option<SetupBase>, price: f64) -> bool {
     // Slack for float noise, so a move of exactly 10% off 1.00 counts as 10%.
     const EPS: f64 = 1e-9;
-    let Some((base_vol, base_px)) = base else { return false };
-    if base_vol == 0 || !(base_px > 0.0) {
+    let Some(b) = base else { return false };
+    if b.cur == 0 || !(b.px > 0.0) {
         return false;
     }
-    let ratio = vol as f64 / base_vol as f64;
-    let pct = (price - base_px) / base_px * 100.0;
-    ratio + EPS >= th.setup_vol_ratio && pct + EPS >= th.setup_price_pct
+    let vol_ok = b.cur as f64 + EPS >= th.setup_vol_ratio * b.prev as f64;
+    let pct = (price - b.px) / b.px * 100.0;
+    vol_ok && pct + EPS >= th.setup_price_pct
 }
 
 /// Vol/m of one ticker at `now`: (shares per minute, window only partly covered, feed stale).
@@ -1002,6 +909,8 @@ pub fn compare(a: &Ticker, b: &Ticker, key: &str) -> Ordering {
         "change" => f(a.change_ratio, b.change_ratio),
         "volume" => a.volume.cmp(&b.volume),
         "mcap" => f(a.market_value, b.market_value),
+        "float" => f(a.float, b.float),
+        "shares" => f(a.total_shares, b.total_shares),
         "volrate" => f(a.vol_rate.unwrap_or(0.0), b.vol_rate.unwrap_or(0.0)),
         "status" => a.status.cmp(&b.status),
         _ => f(a.change_ratio, b.change_ratio).then(a.volume.cmp(&b.volume)),
@@ -1042,6 +951,26 @@ mod tests {
         assert!(!Filters { max_mcap: 1e9, ..Default::default() }.matches(&tk("B", 1.0, 1, 0.1, 0.0)));
     }
 
+    #[test]
+    fn float_and_share_filters_pass_unknown_values() {
+        let known = Ticker { float: 5e6, total_shares: 8e6, ..tk("A", 5.0, 1000, 0.25, 1e6) };
+        let unknown = tk("U", 5.0, 1000, 0.25, 1e6);
+        for f in [
+            Filters { min_float: 6e6, ..Default::default() },
+            Filters { max_float: 4e6, ..Default::default() },
+            Filters { min_shares: 9e6, ..Default::default() },
+            Filters { max_shares: 7e6, ..Default::default() },
+        ] {
+            assert!(!f.matches(&known), "{f:?}");
+            assert!(f.matches(&unknown), "{f:?}");
+        }
+        assert!(Filters { min_float: 1e6, max_float: 1e7, min_shares: 1e6, max_shares: 1e7, ..Default::default() }.matches(&known));
+        // only the float is known: the share bounds still pass
+        let half = Ticker { float: 5e6, ..unknown.clone() };
+        assert!(Filters { max_shares: 1.0, ..Default::default() }.matches(&half));
+        assert!(!Filters { max_float: 1.0, ..Default::default() }.matches(&half));
+    }
+
     /// Engine with SETUP at 300 s / 2.2x / +10% and no eligibility gates.
     fn setup_engine() -> Engine {
         let mut cfg = Config::default();
@@ -1074,8 +1003,10 @@ mod tests {
         let t0 = Instant::now();
         let out = setup_row(&mut e, t0, 0, 1.0, 1000);
         assert_eq!(out.active[0].status, "");
-        // exactly 2.2x and exactly +10%, 300 s later
-        let out = setup_row(&mut e, t0, 300, 1.10, 2200);
+        // 1000 traded in the previous 300 s window
+        assert_eq!(setup_row(&mut e, t0, 300, 1.0, 2000).active[0].status, "");
+        // 2200 in the last window (exactly 2.2x) and exactly +10% on one window ago
+        let out = setup_row(&mut e, t0, 600, 1.10, 4200);
         assert_eq!(out.active[0].status, "SETUP");
         let a = e.alerts().back().unwrap();
         assert_eq!(a.kind, AlertKind::Setup);
@@ -1085,11 +1016,12 @@ mod tests {
 
     #[test]
     fn setup_needs_both_limits() {
-        for (price, vol) in [(1.099, 2200), (1.10, 2199), (1.0, 9000), (3.0, 1000)] {
+        for (price, vol) in [(1.099, 4200), (1.10, 4199), (1.0, 20_000), (3.0, 2000)] {
             let mut e = setup_engine();
             let t0 = Instant::now();
             setup_row(&mut e, t0, 0, 1.0, 1000);
-            let out = setup_row(&mut e, t0, 300, price, vol);
+            setup_row(&mut e, t0, 300, 1.0, 2000);
+            let out = setup_row(&mut e, t0, 600, price, vol);
             assert_eq!(out.new_alerts, 0, "price {price} vol {vol}");
             assert!(kinds(&e).is_empty());
         }
@@ -1112,18 +1044,45 @@ mod tests {
         // nothing was raised (the first list only seeds NEW)
         assert!(out.active.iter().all(|t| t.status.is_empty()));
         assert!(kinds(&e).is_empty());
-        // the tick counter still follows the price move
-        assert_eq!(e.tick_rates(t0 + Duration::from_secs(6))[3], (0, 1));
     }
 
     #[test]
-    fn setup_with_short_history_compares_to_the_oldest_sample() {
+    fn setup_needs_part_of_a_previous_window_and_scales_it() {
+        let t0 = Instant::now();
+        // less history than one window: no previous window to compare with
+        let mut e = setup_engine();
+        setup_row(&mut e, t0, 0, 1.0, 1000);
+        assert_eq!(setup_row(&mut e, t0, 20, 1.2, 3000).new_alerts, 0);
+        // 20 s before the last window is under a tenth of a window: still nothing
+        assert_eq!(setup_row(&mut e, t0, 320, 1.2, 90_000).new_alerts, 0);
+        // 60 s before it, with 200 traded: 1000 per full window, so 2200 in the last one fires
+        let mut e = setup_engine();
+        setup_row(&mut e, t0, 0, 1.0, 1000);
+        setup_row(&mut e, t0, 60, 1.0, 1200);
+        assert_eq!(setup_row(&mut e, t0, 360, 1.1, 3399).new_alerts, 0);
+        assert_eq!(setup_row(&mut e, t0, 360, 1.1, 3400).active[0].status, "SETUP");
+    }
+
+    #[test]
+    fn setup_after_a_quiet_window_fires_on_any_volume() {
         let mut e = setup_engine();
         let t0 = Instant::now();
         setup_row(&mut e, t0, 0, 1.0, 1000);
-        // only 20 s of history, window is 300 s
-        let out = setup_row(&mut e, t0, 20, 1.2, 3000);
+        setup_row(&mut e, t0, 300, 1.0, 1000);
+        let out = setup_row(&mut e, t0, 600, 1.1, 1500);
         assert_eq!(out.active[0].status, "SETUP");
+        assert_eq!(e.alerts().back().unwrap().detail(), "vol from 0  +10.0%");
+    }
+
+    #[test]
+    fn setup_compares_windows_not_the_day_volume() {
+        // a ticker that already traded a million shares spikes again: 2200 vs 1000 per window
+        let mut e = setup_engine();
+        let t0 = Instant::now();
+        setup_row(&mut e, t0, 0, 1.0, 1_000_000);
+        setup_row(&mut e, t0, 300, 1.0, 1_001_000);
+        assert_eq!(setup_row(&mut e, t0, 600, 1.1, 1_003_199).new_alerts, 0);
+        assert_eq!(setup_row(&mut e, t0, 600, 1.1, 1_003_200).active[0].status, "SETUP");
     }
 
     #[test]
@@ -1133,7 +1092,8 @@ mod tests {
         // ticker id 0 has no series
         let z = |p: f64, v: i64| vec![tk("Z", p, v, 0.3, 0.0)];
         e.process(z(1.0, 1000), "change", true, t0);
-        let out = e.process(z(2.0, 9000), "change", true, t0 + Duration::from_secs(300));
+        e.process(z(1.0, 2000), "change", true, t0 + Duration::from_secs(300));
+        let out = e.process(z(2.0, 9000), "change", true, t0 + Duration::from_secs(600));
         assert_eq!(out.new_alerts, 0);
         // a ticker's very first sample is its own baseline
         let mut e = setup_engine();
@@ -1150,24 +1110,21 @@ mod tests {
         // The jump is real, but the baseline is gone: the new series starts at this sample.
         let out = setup_row(&mut e, t0, 300, 1.5, 5000);
         assert_eq!(out.new_alerts, 0);
-        // History rebuilt after the clear works again.
-        let out = setup_row(&mut e, t0, 600, 1.65, 11_000);
+        // History rebuilt after the clear works again: 1000 traded 300-600 s, 2200 600-900 s.
+        assert_eq!(setup_row(&mut e, t0, 600, 1.5, 6000).new_alerts, 0);
+        let out = setup_row(&mut e, t0, 900, 1.65, 8200);
         assert_eq!(out.active[0].status, "SETUP");
     }
 
     #[test]
-    fn setup_baseline_is_the_value_one_window_ago_not_the_oldest() {
+    fn setup_price_baseline_is_one_window_ago() {
         let mut e = setup_engine();
         let t0 = Instant::now();
         setup_row(&mut e, t0, 0, 1.0, 1000);
-        setup_row(&mut e, t0, 100, 1.5, 5000);
-        // Against t=0 this is 9x and +65%; against the point at or before t=100 (300 s ago) it is
-        // 1.8x and +10%: not a SETUP.
-        let out = setup_row(&mut e, t0, 400, 1.65, 9000);
-        assert_eq!(out.new_alerts, 0);
-        // 11000 / 5000 = 2.2x and 1.65 / 1.5 = +10%: SETUP
-        let out = setup_row(&mut e, t0, 400, 1.65, 11_000);
-        assert_eq!(out.active[0].status, "SETUP");
+        setup_row(&mut e, t0, 300, 1.5, 2000);
+        // +65% on t=0 but only +9.9% on one window ago (t=300): not a SETUP
+        assert_eq!(setup_row(&mut e, t0, 600, 1.649, 5000).new_alerts, 0);
+        assert_eq!(setup_row(&mut e, t0, 600, 1.65, 5000).active[0].status, "SETUP");
     }
 
     #[test]
@@ -1180,15 +1137,18 @@ mod tests {
         // volume below the gate, price above
         let mut e = Engine::new(&cfg);
         setup_row(&mut e, t0, 0, 1.0, 1000);
-        assert_eq!(setup_row(&mut e, t0, 300, 1.2, 4999).new_alerts, 0);
+        setup_row(&mut e, t0, 300, 1.0, 2000);
+        assert_eq!(setup_row(&mut e, t0, 600, 1.2, 4999).new_alerts, 0);
         // price below the gate (volume above)
         let mut e = Engine::new(&cfg);
         setup_row(&mut e, t0, 0, 0.5, 10_000);
-        assert_eq!(setup_row(&mut e, t0, 300, 0.99, 30_000).new_alerts, 0);
+        setup_row(&mut e, t0, 300, 0.5, 11_000);
+        assert_eq!(setup_row(&mut e, t0, 600, 0.99, 30_000).new_alerts, 0);
         // exactly at both gates
         let mut e = Engine::new(&cfg);
-        setup_row(&mut e, t0, 0, 0.5, 2000);
-        assert_eq!(setup_row(&mut e, t0, 300, 1.0, 5000).new_alerts, 1);
+        setup_row(&mut e, t0, 0, 0.5, 1000);
+        setup_row(&mut e, t0, 300, 0.5, 2000);
+        assert_eq!(setup_row(&mut e, t0, 600, 1.0, 5000).new_alerts, 1);
     }
 
     #[test]
@@ -1200,12 +1160,14 @@ mod tests {
             u
         };
         e.apply_quotes(&[at(upd(7, 1000, 1, 1.0, 1000), 10)], Session::Reg, t0 + Duration::from_secs(10));
-        e.apply_quotes(&[at(upd(7, 301_000, 2, 1.10, 2200), 310)], Session::Reg, t0 + Duration::from_secs(310));
+        e.apply_quotes(&[at(upd(7, 301_000, 2, 1.0, 2000), 310)], Session::Reg, t0 + Duration::from_secs(310));
+        e.apply_quotes(&[at(upd(7, 601_000, 3, 1.10, 4200), 610)], Session::Reg, t0 + Duration::from_secs(610));
         // a stale REST row; the fresh stream quote overrides it
         let rest = Ticker { ticker_id: 7, prev_close: 1.0, ..tk("A", 1.0, 1000, 0.0, 5e6) };
-        let out = e.process(vec![rest], "change", true, t0 + Duration::from_secs(311));
+        let out = e.process(vec![rest], "change", true, t0 + Duration::from_secs(611));
         assert_eq!(out.active[0].status, "SETUP");
-        assert_eq!(e.alerts().back().unwrap().prev_vol, 1000);
+        let a = e.alerts().back().unwrap();
+        assert_eq!((a.prev_vol, a.curr_vol), (1000, 2200));
     }
 
     /// Status of the only row as the table would show it at `now`.
@@ -1213,17 +1175,18 @@ mod tests {
         e.reapply("change", true, now).active[0].status.clone()
     }
 
-    /// Lists row "A" (id 1) over REST at `t0`, then lets the stream bring it to exactly 2.2x and
-    /// +10% of 300 s ago; no REST fetch follows. Returns the time of that last quote, 310 s on.
+    /// Lists row "A" (id 1) over REST at `t0`, then lets the stream trade 1000 in one 300 s window
+    /// and exactly 2.2x that (+10%) in the next; no REST fetch follows. Returns the time of that
+    /// last quote, 610 s on.
     fn stream_setup_hit(e: &mut Engine, t0: Instant) -> Instant {
         setup_row(e, t0, 0, 1.0, 1000);
         e.set_rest_feeds_series(false);
-        for (s, ms, seq, px, vol) in [(10, 10_000, 1, 1.0, 1000), (310, 310_000, 2, 1.10, 2200)] {
+        for (s, ms, seq, px, vol) in [(10, 10_000, 1, 1.0, 1000), (310, 310_000, 2, 1.0, 2000), (610, 610_000, 3, 1.10, 4200)] {
             let mut u = upd(1, ms, seq, px, vol);
             u.recv = t0 + Duration::from_secs(s);
             e.apply_quotes(&[u], Session::Reg, t0 + Duration::from_secs(s));
         }
-        t0 + Duration::from_secs(310)
+        t0 + Duration::from_secs(610)
     }
 
     #[test]
@@ -1235,20 +1198,20 @@ mod tests {
         // the stream data alone raises nothing; the tick does
         assert!(kinds(&e).is_empty());
 
-        assert_eq!(e.recompute(at(310)), 1);
+        assert_eq!(e.recompute(at(610)), 1);
         assert_eq!(kinds(&e), vec![AlertKind::Setup]);
-        assert_eq!(status_at(&e, at(310)), "SETUP");
+        assert_eq!(status_at(&e, at(610)), "SETUP");
         let a = e.alerts().back().unwrap();
-        assert_eq!((a.at, a.prev_vol, a.curr_vol), (at(310), 1000, 2200));
+        assert_eq!((a.at, a.prev_vol, a.curr_vol), (at(610), 1000, 2200));
 
         // the limits still hold on every following tick, but the cooldown keeps it to one alert
-        for s in (311..430).step_by(3) {
+        for s in (611..730).step_by(3) {
             assert_eq!(e.recompute(at(s)), 0, "second {s}");
         }
-        assert_eq!(e.recompute(at(429)), 0);
+        assert_eq!(e.recompute(at(729)), 0);
         assert_eq!(kinds(&e).len(), 1);
         // once the cooldown (120 s) is over and the condition still holds, it is raised again
-        assert_eq!(e.recompute(at(430)), 1);
+        assert_eq!(e.recompute(at(730)), 1);
         assert_eq!(kinds(&e).len(), 2);
     }
 
@@ -1280,18 +1243,18 @@ mod tests {
         let at = |s: u64| t0 + Duration::from_secs(s);
         let a = tk("A", 1.0, 1000, 0.1, 0.0);
         let b = tk("B", 1.0, 1000, 0.1, 0.0);
-        assert!(e.raise(AlertKind::Setup, &a, None, at(0), "00:00:00"));
+        assert!(e.raise(AlertKind::Setup, &a, None, at(0), 0));
         // same symbol and kind: held back for the whole cooldown
-        assert!(!e.raise(AlertKind::Setup, &a, None, at(1), "00:00:01"));
-        assert!(!e.raise(AlertKind::Setup, &a, None, at(119), "00:01:59"));
+        assert!(!e.raise(AlertKind::Setup, &a, None, at(1), 0));
+        assert!(!e.raise(AlertKind::Setup, &a, None, at(119), 0));
         // another kind of the same symbol, and the same kind of another symbol, are independent
-        assert!(e.raise(AlertKind::New, &a, None, at(2), "00:00:02"));
-        assert!(e.raise(AlertKind::Setup, &b, None, at(3), "00:00:03"));
+        assert!(e.raise(AlertKind::New, &a, None, at(2), 0));
+        assert!(e.raise(AlertKind::Setup, &b, None, at(3), 0));
         assert_eq!(e.alerts().len(), 3);
         // the cooldown counts from the last raise
-        assert!(e.raise(AlertKind::Setup, &a, None, at(120), "00:02:00"));
-        assert!(!e.raise(AlertKind::Setup, &a, None, at(239), "00:03:59"));
-        assert!(e.raise(AlertKind::Setup, &a, None, at(240), "00:04:00"));
+        assert!(e.raise(AlertKind::Setup, &a, None, at(120), 0));
+        assert!(!e.raise(AlertKind::Setup, &a, None, at(239), 0));
+        assert!(e.raise(AlertKind::Setup, &a, None, at(240), 0));
     }
 
     #[test]
@@ -1300,9 +1263,9 @@ mod tests {
         e.apply_config(&Config { alert_cooldown_sec: 10, max_market_cap: 0.0, ..Config::default() });
         let t0 = Instant::now();
         let a = tk("A", 1.0, 1000, 0.1, 0.0);
-        assert!(e.raise(AlertKind::Setup, &a, None, t0, ""));
-        assert!(!e.raise(AlertKind::Setup, &a, None, t0 + Duration::from_secs(9), ""));
-        assert!(e.raise(AlertKind::Setup, &a, None, t0 + Duration::from_secs(10), ""));
+        assert!(e.raise(AlertKind::Setup, &a, None, t0, 0));
+        assert!(!e.raise(AlertKind::Setup, &a, None, t0 + Duration::from_secs(9), 0));
+        assert!(e.raise(AlertKind::Setup, &a, None, t0 + Duration::from_secs(10), 0));
     }
 
     #[test]
@@ -1346,7 +1309,7 @@ mod tests {
         e.process(vec![Ticker { ticker_id: 1, ..tk("A", 1.0, 1000, 0.1, 0.0) }], "change", true, t0);
         assert_eq!(status_at(&e, at(1)), "NEW");
         let a = tk("A", 1.0, 1000, 0.1, 0.0);
-        assert!(e.raise(AlertKind::Setup, &a, None, at(30), ""));
+        assert!(e.raise(AlertKind::Setup, &a, None, at(30), 0));
         assert_eq!(status_at(&e, at(31)), "SETUP");
         // NEW (from 0 s) is covered by SETUP while both are held; SETUP outlasts it (30 s + 120 s)
         e.recompute(at(121));
@@ -1363,21 +1326,24 @@ mod tests {
         let mut e = engine();
         e.toggle_blacklist("A");
         let a = tk("A", 1.0, 1000, 0.1, 0.0);
-        assert!(!e.raise(AlertKind::Setup, &a, None, Instant::now(), ""));
+        assert!(!e.raise(AlertKind::Setup, &a, None, Instant::now(), 0));
         assert!(e.alerts().is_empty() && e.fired.is_empty());
     }
 
     #[test]
     fn setup_met_edges() {
         let th = Thresholds::from_config(&Config::default());
-        assert!(setup_met(&th, Some((1000, 1.0)), 2200, 1.10));
-        assert!(!setup_met(&th, Some((1000, 1.0)), 2199, 1.10));
-        assert!(!setup_met(&th, Some((1000, 1.0)), 2200, 1.0999));
-        assert!(!setup_met(&th, None, 2200, 1.10));
-        assert!(!setup_met(&th, Some((0, 1.0)), 2200, 1.10));
-        assert!(!setup_met(&th, Some((1000, 0.0)), 2200, 1.10));
+        let b = |prev, cur, px| Some(SetupBase { prev, cur, px });
+        assert!(setup_met(&th, b(1000, 2200, 1.0), 1.10));
+        assert!(!setup_met(&th, b(1000, 2199, 1.0), 1.10));
+        assert!(!setup_met(&th, b(1000, 2200, 1.0), 1.0999));
+        assert!(!setup_met(&th, None, 1.10));
+        // a quiet previous window: anything traded now counts, nothing traded does not
+        assert!(setup_met(&th, b(0, 1, 1.0), 1.10));
+        assert!(!setup_met(&th, b(0, 0, 1.0), 1.10));
+        assert!(!setup_met(&th, b(1000, 2200, 0.0), 1.10));
         // a falling price never counts
-        assert!(!setup_met(&th, Some((1000, 1.0)), 5000, 0.5));
+        assert!(!setup_met(&th, b(1000, 5000, 1.0), 0.5));
     }
 
     #[test]
@@ -1393,7 +1359,8 @@ mod tests {
         cfg.setup_vol_ratio = 1.5;
         cfg.setup_price_pct = 5.0;
         e.apply_config(&cfg);
-        let out = setup_row(&mut e, t0, 60, 1.05, 1500);
+        setup_row(&mut e, t0, 60, 1.0, 2000);
+        let out = setup_row(&mut e, t0, 120, 1.05, 3500);
         assert_eq!(out.active[0].status, "SETUP");
     }
 
@@ -1566,7 +1533,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.vol_m_window_seconds = 30;
         cfg.setup_window_sec = 200;
-        assert_eq!(series_horizon(&Thresholds::from_config(&cfg)), Duration::from_secs(260));
+        assert_eq!(series_horizon(&Thresholds::from_config(&cfg)), Duration::from_secs(460));
         cfg.vol_m_window_seconds = 300;
         cfg.setup_window_sec = 60;
         assert_eq!(series_horizon(&Thresholds::from_config(&cfg)), Duration::from_secs(360));
@@ -1754,7 +1721,7 @@ mod tests {
         assert_eq!(out.new_alerts, 0);
         assert!(e.alerts.is_empty());
         assert_eq!(out.blacklisted[0].symbol, "BL");
-        assert!(e.last.contains_key("BL"));
+        assert!(e.candles("BL").is_some());
     }
 
     #[test]
@@ -2072,7 +2039,10 @@ mod tests {
             rows
         };
         let c = |start| Candle { start, open: 1.0, high: 1.0, low: 1.0, close: 1.0, volume: 1 };
-        e.load_candles(vec![("A".into(), c(600)), ("A".into(), c(660)), ("A".into(), c(660))]);
+        // saved candles go in front and are marked as stored (as App::load_saved_candles does)
+        let saved = [c(600), c(660)];
+        e.insert_candles("A", &saved);
+        e.mark_stored(&saved.iter().map(|b| ("A".to_string(), *b)).collect::<Vec<_>>());
         assert_eq!(e.candles("A").unwrap().len(), 2);
         assert!(take(&mut e, 10_000).is_empty());
         e.record_sample("A", 780, 2.0, 5); // a later minute appends after the reloaded ones
@@ -2080,6 +2050,29 @@ mod tests {
         let got = take(&mut e, 10_000);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].1.start, 780);
+    }
+
+    #[test]
+    fn backfill_fills_gaps_and_never_replaces_our_candles() {
+        let mut e = engine();
+        let c = |start, p| Candle { start, open: p, high: p, low: p, close: p, volume: 1 };
+        e.record_sample("A", 300, 5.0, 100);
+        // 300 is a minute we hold: ours is kept; earlier bars go in front, in order
+        let added = e.insert_candles("A", &[c(120, 1.0), c(180, 2.0), c(240, 3.0), c(300, 9.0)]);
+        assert_eq!(added.iter().map(|c| c.start).collect::<Vec<_>>(), vec![120, 180, 240]);
+        let starts = |e: &Engine| e.candles("A").unwrap().iter().map(|c| c.start).collect::<Vec<i64>>();
+        assert_eq!(starts(&e), vec![120, 180, 240, 300]);
+        assert_eq!(e.candles("A").unwrap()[3].close, 5.0);
+        assert_eq!(e.first_candle_start("A"), Some(120));
+        // a gap in the middle is filled in order, repeats are skipped
+        e.record_sample("A", 600, 6.0, 200);
+        assert_eq!(e.insert_candles("A", &[c(480, 4.0), c(420, 3.5), c(240, 0.1)]).len(), 2);
+        assert_eq!(starts(&e), vec![120, 180, 240, 300, 420, 480, 600]);
+        // a symbol with nothing yet takes the bars as they are
+        e.insert_candles("B", &[c(60, 1.0), c(120, 2.0)]);
+        assert_eq!(e.candles("B").unwrap().len(), 2);
+        assert_eq!(e.first_candle_start("C"), None);
+        assert_eq!(e.stored_upto("A"), None);
     }
 
     #[test]
@@ -2312,159 +2305,6 @@ mod tests {
         assert_eq!(ids[..90], (1..=90u64).collect::<Vec<_>>()[..]);
     }
 
-    fn secs(n: u64) -> Duration {
-        Duration::from_secs(n)
-    }
-
-    #[test]
-    fn high_low_first_quote_seeds_and_arms_after_60s() {
-        let mut h = HighLow::default();
-        let t0 = Instant::now();
-        h.quote(1, 1.0, None, None, t0);
-        // new extremes inside the arming delay move the levels but raise nothing
-        h.quote(1, 1.1, None, None, t0 + secs(30));
-        h.quote(1, 0.8, None, None, t0 + secs(59));
-        assert_eq!(h.counts(t0 + secs(59)), [(0, 0); 4]);
-        // armed: above the old high of 1.1 is a new high, below 0.8 a new low
-        h.quote(1, 1.2, None, None, t0 + secs(60));
-        h.quote(1, 0.7, None, None, t0 + secs(62));
-        // inside the range: nothing
-        h.quote(1, 1.0, None, None, t0 + secs(64));
-        assert_eq!(h.counts(t0 + secs(65)), [(1, 1); 4]);
-    }
-
-    #[test]
-    fn high_low_one_event_per_second_per_ticker_but_the_level_still_moves() {
-        let mut h = HighLow::default();
-        let t0 = Instant::now();
-        h.quote(1, 1.0, None, None, t0);
-        let t = t0 + secs(100);
-        h.quote(1, 1.1, None, None, t);
-        h.quote(1, 1.2, None, Some(0.9), t + Duration::from_millis(500)); // throttled
-        assert_eq!(h.counts(t + secs(1)), [(1, 0); 4]);
-        // 1.2 was absorbed: 1.2 again is no new high, 1.3 is (1 s after the last event)
-        h.quote(1, 1.2, None, None, t + secs(2));
-        h.quote(1, 1.3, None, None, t + secs(2));
-        assert_eq!(h.counts(t + secs(3)), [(2, 0); 4]);
-        // another ticker is not throttled by the first
-        h.quote(2, 5.0, None, None, t0);
-        h.quote(2, 5.5, None, None, t + secs(1));
-        assert_eq!(h.counts(t + secs(3)), [(3, 0); 4]);
-    }
-
-    #[test]
-    fn high_low_day_high_and_low_count_in_the_regular_session() {
-        let mut h = HighLow::default();
-        let t0 = Instant::now();
-        // seeds from the day range, not only the price
-        h.quote(1, 1.2, Some(1.5), Some(1.0), t0);
-        h.quote(1, 1.4, Some(1.5), Some(1.0), t0 + secs(100));
-        assert_eq!(h.counts(t0 + secs(100)), [(0, 0); 4]);
-        // the day high moves: that is a new high even though the price is below it
-        h.quote(1, 1.4, Some(1.6), Some(1.0), t0 + secs(101));
-        // the day low moves
-        h.quote(1, 1.4, Some(1.6), Some(0.95), t0 + secs(103));
-        assert_eq!(h.counts(t0 + secs(104)), [(1, 1); 4]);
-    }
-
-    #[test]
-    fn high_low_windows_exclude_age_equal_to_the_window() {
-        let mut h = HighLow::default();
-        let t0 = Instant::now();
-        h.quote(1, 1.0, None, None, t0);
-        let t = t0 + secs(100);
-        h.quote(1, 1.1, None, None, t); // high
-        h.quote(1, 0.9, None, None, t + secs(2)); // low
-        h.quote(1, 1.2, None, None, t + secs(4)); // high
-        // order is 20m, 5m, 1m, 30s
-        assert_eq!(h.counts(t + secs(29)), [(2, 1); 4]);
-        // the first high is exactly 30 s old: out of the 30 s window only
-        assert_eq!(h.counts(t + secs(30)), [(2, 1), (2, 1), (2, 1), (1, 1)]);
-        assert_eq!(h.counts(t + secs(32)), [(2, 1), (2, 1), (2, 1), (1, 0)]);
-        assert_eq!(h.counts(t + secs(62)), [(2, 1), (2, 1), (1, 0), (0, 0)]);
-        assert_eq!(h.counts(t + secs(300)), [(2, 1), (1, 1), (0, 0), (0, 0)]);
-        assert_eq!(h.counts(t + secs(1202)), [(1, 0), (0, 0), (0, 0), (0, 0)]);
-        assert_eq!(h.counts(t + secs(1204)), [(0, 0); 4]);
-        h.prune(t + secs(1204));
-        assert!(h.events.is_empty());
-    }
-
-    #[test]
-    fn high_low_session_change_or_series_clear_reseeds_but_keeps_events() {
-        let mut h = HighLow::default();
-        let t0 = Instant::now();
-        h.sync(Session::Pre, 0);
-        h.quote(1, 1.0, None, None, t0);
-        h.quote(1, 1.1, None, None, t0 + secs(100));
-        assert_eq!(h.counts(t0 + secs(100))[0], (1, 0));
-        // regular session opens: the old levels are gone, a lower price is only a new seed
-        h.sync(Session::Reg, 0);
-        h.quote(1, 0.5, None, None, t0 + secs(110));
-        h.quote(1, 0.4, None, None, t0 + secs(120)); // not armed yet
-        assert_eq!(h.counts(t0 + secs(120))[0], (1, 0)); // the earlier event is still counted
-        // a series clear does the same
-        h.quote(1, 0.3, None, None, t0 + secs(200)); // armed: new low
-        assert_eq!(h.counts(t0 + secs(200))[0], (1, 1));
-        h.sync(Session::Reg, 1);
-        h.quote(1, 0.2, None, None, t0 + secs(210)); // reseeded, not armed
-        assert_eq!(h.counts(t0 + secs(210))[0], (1, 1));
-    }
-
-    fn hl_engine() -> (Engine, Instant) {
-        let (mut e, t0) = live_engine(); // ticker id 7, symbol "A"
-        // seeds the tracker
-        e.apply_quotes(&[upd(7, 1000, 1, 1.0, 1000)], Session::Reg, t0);
-        (e, t0)
-    }
-
-    #[test]
-    fn engine_counts_new_highs_from_stream_quotes() {
-        let (mut e, t0) = hl_engine();
-        let t = t0 + secs(70);
-        e.apply_quotes(&[upd(7, 2000, 2, 1.2, 2000)], Session::Reg, t);
-        assert_eq!(e.high_low_counts(t)[3], (1, 0));
-        // a day low from the stream counts as a new low
-        let mut u = upd(7, 3000, 3, 1.2, 3000);
-        u.low = Some(0.7);
-        e.apply_quotes(&[u], Session::Reg, t + secs(2));
-        assert_eq!(e.high_low_counts(t + secs(2))[3], (1, 1));
-    }
-
-    #[test]
-    fn engine_ignores_blacklisted_unlisted_and_closed() {
-        let (mut e, t0) = hl_engine();
-        let t = t0 + secs(70);
-        // closed session: no tracking at all
-        e.apply_quotes(&[upd(7, 2000, 2, 1.2, 2000)], Session::Closed, t);
-        // an id that is not on the list
-        e.apply_quotes(&[upd(99, 2000, 2, 1.2, 2000)], Session::Reg, t);
-        assert_eq!(e.high_low_counts(t), [(0, 0); 4]);
-        e.toggle_blacklist("A");
-        e.apply_quotes(&[upd(7, 3000, 3, 1.3, 3000)], Session::Reg, t + secs(2));
-        assert_eq!(e.high_low_counts(t + secs(2)), [(0, 0); 4]);
-    }
-
-    #[test]
-    fn engine_restarts_on_session_change_and_stream_reconnect() {
-        let (mut e, t0) = hl_engine();
-        let t = t0 + secs(70);
-        e.apply_quotes(&[upd(7, 2000, 2, 1.2, 2000)], Session::Reg, t);
-        assert_eq!(e.high_low_counts(t)[3], (1, 0));
-        // new session: this quote only seeds, the event already counted stays
-        e.apply_quotes(&[upd(7, 3000, 3, 1.5, 3000)], Session::After, t + secs(5));
-        assert_eq!(e.high_low_counts(t + secs(5))[3], (1, 0));
-        // reconnect clears the series store: the next quote seeds again
-        e.on_stream_reconnect();
-        e.apply_quotes(&[upd(7, 4000, 4, 1.8, 4000)], Session::After, t + secs(10));
-        e.apply_quotes(&[upd(7, 5000, 5, 1.9, 5000)], Session::After, t + secs(20));
-        assert_eq!(e.high_low_counts(t + secs(20))[3], (1, 0));
-        // armed 60 s after the reseed
-        e.apply_quotes(&[upd(7, 6000, 6, 2.0, 6000)], Session::After, t + secs(71));
-        // 30 s: only the new one; 1 m: the first (71 s old) is out; 5 m: both
-        let c = e.high_low_counts(t + secs(71));
-        assert_eq!((c[3].0, c[2].0, c[1].0), (1, 1, 2));
-    }
-
     #[test]
     fn config_change_updates_series_horizon() {
         let mut cfg = Config::default();
@@ -2477,8 +2317,8 @@ mod tests {
         for i in 0..=200u64 {
             e.process(vec![a(100 + i as i64)], "change", true, t0 + Duration::from_secs(i));
         }
-        // 30 s window + 60 s margin
-        assert!(e.series().len(1) < 95);
+        // two 30 s SETUP windows + 60 s margin
+        assert!(e.series().len(1) < 125);
         assert!(e.series().vol_at(1, t0 + Duration::from_secs(110)).is_some());
     }
 }

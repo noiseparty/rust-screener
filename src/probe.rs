@@ -1,4 +1,4 @@
-//! Probe mode (`volume_screener.exe --probe`): a headless recorder for checking stream behaviour
+//! Probe mode (`MarketGUI-cli.exe --probe`): a headless recorder for checking stream behaviour
 //! across session changes. Writes every raw message and connection event to
 //! `probe\probe-YYYY-MM-DD.csv` and prints a short status line now and then. Stops on Ctrl+C.
 
@@ -250,7 +250,14 @@ fn say(text: &str) {
 pub fn run(dir: Option<PathBuf>) -> Result<(), String> {
     let dir = match dir {
         Some(d) => d,
-        None => Paths::from_env().map_err(|e| e.to_string())?.probe,
+        None => {
+            let p = Paths::from_env().map_err(|e| e.to_string())?;
+            // move the old app home first, or creating `probe\` would block it
+            if let Err(e) = p.migrate_home() {
+                eprintln!("could not rename the old app home: {e}");
+            }
+            p.probe
+        }
     };
     let (mut rec, path) = open_csv(&dir, Local::now().date_naive()).map_err(|e| format!("{}: {e}", dir.display()))?;
 

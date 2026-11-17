@@ -4,14 +4,14 @@ Handoff (updated 2026-11-17, after step 19). Read this, then `todo.md`, then `do
 
 ## What this is
 
-Rust TUI stock screener (`volume_screener`), a port of the Go `volume_checker_v1.2`. It shows Webull top gainers from the live push stream (MQTT over WSS, REST fallback), raises NEW and SETUP alerts and renders a highlowtick.com-style dashboard. `README.md` describes the finished behaviour.
+Rust stock screener MarketGUI (package `volume_screener`, formerly Volume Screener), a port of the Go `volume_checker_v1.2`. It shows Webull top gainers from the live push stream (MQTT over WSS, REST fallback), raises NEW and SETUP alerts and renders a highlowtick.com-style dashboard. `README.md` describes the finished behaviour.
 
 - Repo: `C:\Users\ZX202\kodi\rust-screener`, branch `master`. Not pushed; push only when the user asks. The GitHub remote https://github.com/noiseparty/rust-screener is **public**.
 - Specs: `docs/plan.md` = user decisions (**authoritative**); `docs/stream-design.md` = technical design. Where they differ, `plan.md` wins.
 
 ## State
 
-All build steps 1-19 are done and committed (see `todo.md`). `cargo build --release` has 0 warnings and all tests pass. The release exe is `volume_screener.exe` in the project root (gitignored; rebuild with `cargo build --release` and copy `target\release\volume_screener.exe`). Clippy is not installed for the toolchain, so no clippy pass was done (installing it is a `rustup component add` outside the project and needs the user's approval).
+All build steps 1-19 are done and committed (see `todo.md`). `cargo build --release` has 0 warnings and all tests pass. The release exes are `MarketGUI.exe` (window) and `MarketGUI-cli.exe` (terminal UI, `--probe`) in the project root (gitignored; rebuild with `cargo build --release` and copy them from `target\release\`). Clippy is not installed for the toolchain, so no clippy pass was done (installing it is a `rustup component add` outside the project and needs the user's approval).
 
 ## Untested on screen
 
@@ -19,13 +19,13 @@ Only unit tests have run. The TUI and the live stream have not been run against 
 
 - Header indicator, Vol/m column, Mov, dimmed rows, sticky Status badge, rate tabs (`t`), Settings screen with the new fields.
 - NEW / SETUP alerts firing live, including the cooldown.
-- Candle files being written to `%LOCALAPPDATA%\VolumeScreener\data\`, reloaded on restart and purged the next day.
+- Candle files being written to `%LOCALAPPDATA%\MarketGUI\data\`, reloaded on restart and purged the next day.
 - Config move from the current directory to the app home on first run.
 - Stream reconnect and REST fallback behaviour over a long session.
 
 ## Waiting on the user
 
-1. Run `volume_screener.exe --probe` for a full day (before 11:00 to after 23:00 Riga time) and share `probe\probe-YYYY-MM-DD.csv`.
+1. Run `MarketGUI-cli.exe --probe` for a full day (before 11:00 to after 23:00 Riga time) and share `probe\probe-YYYY-MM-DD.csv`.
 2. Use the probe data to check:
    - `MAX_SUBS = 100` (src/engine.rs) is an assumption; an earlier probe showed 200 subscriptions accepted. Raise or keep the cap accordingly.
    - The step-9 rule that drops quotes from an older session (series store ingest rules) against what the stream sends at session changes.
@@ -40,7 +40,7 @@ Only unit tests have run. The TUI and the live stream have not been run against 
 - NEW = on the gainers list now and not in the last 30 min; no startup flood.
 - Rate panel tabs with `t`: New Highs/Lows (default) and Up/Down ticks.
 - Recompute/re-rank every 500 or 1000 ms. Mov = rank change on the full board. A row that stops passing a filter stays dimmed 60 s.
-- No installer. Config and data in `%LOCALAPPDATA%\VolumeScreener\`; 1-minute candles saved daily, previous days deleted on launch.
+- No installer. Config and data in `%LOCALAPPDATA%\MarketGUI\` (an old `VolumeScreener` folder is renamed to it on launch); 1-minute candles saved per ticker (`data\candles\<SYMBOL>.csv`, nothing deleted automatically; Config -> Storage deletes), 5m/1h/4h/D bars cached in `data\bars\<tf>\`.
 - Sessions in Riga winter time: pre 11:00, regular 16:30, after 23:00; code uses America/New_York so DST is automatic.
 
 ## Stream facts (verified live)

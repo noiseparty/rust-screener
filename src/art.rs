@@ -527,9 +527,141 @@ pub fn gear_frame(t: f64) -> Vec<(char, Rgb)> {
     cells
 }
 
+// ───────────────────────────── halftone ─────────────────────────────
+
+/// Background behind the boot scene's dots.
+pub const NIGHT: Rgb = [3.0, 5.0, 10.0];
+
+/// A grid of dots, row-major: colour and coverage (0-1, the dot's share of its square).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Halftone {
+    pub w: usize,
+    pub h: usize,
+    pub dots: Vec<(Rgb, f64)>,
+    /// Fill under the dots (`None`: whatever is behind).
+    pub bg: Option<Rgb>,
+}
+
+impl Halftone {
+    /// Box-averages a `sw` x `sh` grid of dots to `w` x `h`: coverage is the mean over the box,
+    /// colour the coverage-weighted mean.
+    pub fn resample(src: &[(Rgb, f64)], sw: usize, sh: usize, w: usize, h: usize) -> Halftone {
+        // source range of target index i (at least one source dot, also when enlarging)
+        let span = |i: usize, s: usize, t: usize| {
+            let a = (i * s / t).min(s - 1);
+            (a, ((i + 1) * s).div_ceil(t).clamp(a + 1, s))
+        };
+        let mut dots = Vec::with_capacity(w * h);
+        for y in 0..h {
+            let (y0, y1) = span(y, sh, h);
+            for x in 0..w {
+                let (x0, x1) = span(x, sw, w);
+                let (mut col, mut cov, mut n) = ([0.0; 3], 0.0, 0.0);
+                for yy in y0..y1 {
+                    for (c, k) in &src[yy * sw + x0..yy * sw + x1] {
+                        for i in 0..3 {
+                            col[i] += c[i] * k;
+                        }
+                        cov += k;
+                        n += 1.0;
+                    }
+                }
+                let col = if cov > 0.0 { col.map(|v| v / cov) } else { [0.0; 3] };
+                dots.push((col, cov / n));
+            }
+        }
+        Halftone { w, h, dots, bg: None }
+    }
+}
+
+/// An image pixel as a dot: coverage from luminance, colour brightened toward full intensity
+/// (hue kept), so dot size carries the brightness.
+pub fn dot(c: Rgb) -> (Rgb, f64) {
+    let lum = (0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]) / 255.0;
+    let max = c[0].max(c[1]).max(c[2]);
+    if lum <= 0.0 || max <= 0.0 {
+        return ([0.0; 3], 0.0);
+    }
+    let k = (1.0 / lum).min(255.0 / max);
+    (c.map(|v| v * k), lum.min(1.0))
+}
+
+/// The boot scene at time `t` as `w` x `h` dots: fitted, centred, no dots outside the image.
+pub fn scene_halftone(t: f64, w: usize, h: usize) -> Halftone {
+    let src: Vec<(Rgb, f64)> = mausoleum().frame(t).into_iter().map(dot).collect();
+    let scale = (w as f64 / SCENE_W as f64).min(h as f64 / SCENE_H as f64);
+    let fw = ((SCENE_W as f64 * scale).round() as usize).min(w);
+    let fh = ((SCENE_H as f64 * scale).round() as usize).min(h);
+    let mut out = Halftone { w, h, dots: vec![([0.0; 3], 0.0); w * h], bg: Some(NIGHT) };
+    if fw == 0 || fh == 0 {
+        return out;
+    }
+    let fit = Halftone::resample(&src, SCENE_W, SCENE_H, fw, fh);
+    let (ox, oy) = ((w - fw) / 2, (h - fh) / 2);
+    for y in 0..fh {
+        out.dots[(y + oy) * w + ox..(y + oy) * w + ox + fw].copy_from_slice(&fit.dots[y * fw..(y + 1) * fw]);
+    }
+    out
+}
+
+/// The gear and wrench at time `t` as `w` x `h` dots. `gear_frame`'s characters are weighed
+/// (█ 1, ▓ .75, ▒ .5) and split into two square dots each (cells are twice as tall as wide).
+pub fn gear_halftone(t: f64, w: usize, h: usize) -> Halftone {
+    let cells = gear_frame(t);
+    let weight = |ch: char| match ch {
+        '█' => 1.0,
+        '▓' => 0.75,
+        '▒' => 0.5,
+        _ => 0.0,
+    };
+    let mut src = Vec::with_capacity(GEAR_W * GEAR_H * 2);
+    for y in 0..GEAR_H * 2 {
+        src.extend(cells[y / 2 * GEAR_W..(y / 2 + 1) * GEAR_W].iter().map(|&(ch, c)| (c, weight(ch))));
+    }
+    Halftone::resample(&src, GEAR_W, GEAR_H * 2, w, h)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resample_keeps_mean_coverage_and_weights_colour() {
+        let (red, blue) = ([255.0, 0.0, 0.0], [0.0, 0.0, 255.0]);
+        // 4x2: left half red at 1.0, right half blue at 0.5 and empty
+        let src = [(red, 1.0), (red, 1.0), (blue, 0.5), (blue, 0.0), (red, 1.0), (red, 1.0), (blue, 0.5), (blue, 0.0)];
+        let h = Halftone::resample(&src, 4, 2, 2, 1);
+        assert_eq!(h.dots, vec![(red, 1.0), (blue, 0.25)]);
+        // one dot to many: copies
+        let up = Halftone::resample(&[(red, 0.5)], 1, 1, 3, 2);
+        assert_eq!(up.dots, vec![(red, 0.5); 6]);
+        assert!(Halftone::resample(&src, 4, 2, 0, 0).dots.is_empty());
+    }
+
+    #[test]
+    fn dot_size_follows_brightness() {
+        assert_eq!(dot([0.0; 3]).1, 0.0);
+        let (white, k) = dot([255.0; 3]);
+        assert!((k - 1.0).abs() < 1e-9 && white == [255.0; 3]);
+        let (c, k) = dot([26.0, 40.0, 80.0]);
+        assert!(k < 0.2 && c[2] == 255.0 && c[0] < c[1]);
+    }
+
+    #[test]
+    fn scene_and_gear_halftones_fit_any_size() {
+        let s = scene_halftone(0.0, 40, 30);
+        assert_eq!((s.w, s.h, s.dots.len()), (40, 30, 1200));
+        // 40 wide fixes the scale: the image is 40x23, centred vertically
+        assert_eq!(s.dots[0].1, 0.0);
+        assert!(s.dots[15 * 40 + 20].1 > 0.0);
+        assert_eq!(s.bg, Some(NIGHT));
+        for (w, h) in [(48, 50), (24, 24), (12, 12)] {
+            let g = gear_halftone(1.0, w, h);
+            assert_eq!(g.dots.len(), w * h);
+            let lit = g.dots.iter().filter(|d| d.1 > 0.2).count();
+            assert!(lit > w * h / 8, "{w}x{h}: {lit} dots");
+        }
+    }
 
     #[test]
     fn noise_matches_kit_js_range_and_determinism() {

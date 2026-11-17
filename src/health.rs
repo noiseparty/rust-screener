@@ -13,29 +13,24 @@ fn check(name: &'static str, url: &str, expect: u16) -> CheckResult {
         .user_agent(USER_AGENT)
         .build();
     let start = Instant::now();
-    let (ok, message) = match agent.get(url).call() {
+    // Webull counts against the shared request budget (and reports its 403 pause)
+    let res = if url.contains("webullfintech.com") { crate::limiter::get(&agent, url) } else { agent.get(url).call().map_err(|e| e.to_string()) };
+    let (ok, message) = match res {
         Ok(r) if r.status() == expect => (true, format!("OK ({}ms)", start.elapsed().as_millis())),
         Ok(r) => (false, format!("HTTP {}", r.status())),
-        Err(ureq::Error::Status(code, _)) => (false, format!("HTTP {code}")),
-        Err(e) => (false, e.kind().to_string()),
+        Err(e) => (false, e),
     };
     CheckResult { name, ok, message }
 }
 
-pub fn run_all(finviz_proxy_url: &str) -> Vec<CheckResult> {
-    let mut out = vec![
+/// Connection checks: internet access and the stock data source (Webull).
+pub fn run_all() -> Vec<CheckResult> {
+    vec![
         check("Network", "http://connectivitycheck.gstatic.com/generate_204", 204),
         check(
-            "Webull API",
+            "Stock Data Source",
             "https://quotes-gw.webullfintech.com/api/bgw/market/pcIndex?regionId=6&pageSize=1",
             200,
         ),
-    ];
-    let proxy = finviz_proxy_url.trim_end_matches('/');
-    out.push(if proxy.is_empty() {
-        CheckResult { name: "Finviz Proxy", ok: false, message: "Not configured".into() }
-    } else {
-        check("Finviz Proxy", &format!("{proxy}/api/health"), 200)
-    });
-    out
+    ]
 }

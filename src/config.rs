@@ -12,33 +12,46 @@ pub const FILTER_NAMES: [&str; 3] = ["ALL", "NEW", "SETUP"];
 const SETUP_KEY_MIGRATION: [(&str, &str); 2] =
     [("spike_vol_ratio", "setup_vol_ratio"), ("baseline_window_sec", "setup_window_sec")];
 
-/// The two panels of the rate area.
+/// Dashboard layout, picked with the header tabs or `w`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RateTab {
-    /// Price up / down ticks.
-    Ticks,
-    /// Session new highs / new lows (the default; an unknown value in the file also lands here).
+#[serde(rename_all = "lowercase")]
+pub enum Layout {
+    /// Alerts and the list, the chart beside them when the window is wide enough.
     #[default]
-    #[serde(other)]
-    HighsLows,
+    Full,
+    /// Alerts and the list, full width.
+    List,
+    /// The chart only.
+    Chart,
+    /// The alerts only, full height and scrollable.
+    Alerts,
 }
 
-impl RateTab {
-    pub fn toggled(self) -> RateTab {
+impl Layout {
+    pub const ALL: [Layout; 4] = [Layout::Full, Layout::List, Layout::Chart, Layout::Alerts];
+
+    pub fn label(self) -> &'static str {
         match self {
-            RateTab::HighsLows => RateTab::Ticks,
-            RateTab::Ticks => RateTab::HighsLows,
+            Layout::Full => "Full",
+            Layout::List => "List",
+            Layout::Chart => "Chart",
+            Layout::Alerts => "Alerts",
         }
     }
 
-    pub fn title(self) -> &'static str {
-        match self {
-            RateTab::HighsLows => "New Highs/Lows",
-            RateTab::Ticks => "Up/Down ticks",
-        }
+    pub fn next(self) -> Layout {
+        Layout::ALL[(Layout::ALL.iter().position(|&l| l == self).unwrap_or(0) + 1) % Layout::ALL.len()]
+    }
+
+    /// Whether this layout can show the chart.
+    pub fn has_chart(self) -> bool {
+        matches!(self, Layout::Full | Layout::Chart)
     }
 }
+
+/// Rows of the dashboard alerts panel: least, most.
+pub const ALERT_ROWS_MIN: u16 = 5;
+pub const ALERT_ROWS_MAX: u16 = 15;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -56,7 +69,8 @@ pub struct Config {
     // SETUP: volume ratio and price change versus `setup_window_sec` ago
     /// Window of the SETUP look-back, in seconds. Old files call it `baseline_window_sec`.
     pub setup_window_sec: u64,
-    /// Volume now divided by volume `setup_window_sec` ago. Old files: `spike_vol_ratio`.
+    /// Volume of the last `setup_window_sec` divided by the volume of the window before it.
+    /// Old files: `spike_vol_ratio`.
     pub setup_vol_ratio: f64,
     /// Price change in percent versus `setup_window_sec` ago (10 = +10%). Old files: `pump_price_pct`
     /// (a fraction, 0.05 = 5%).
@@ -73,12 +87,31 @@ pub struct Config {
     pub max_volume: i64,
     pub min_price: f64,
     pub max_price: f64,
+    /// Float and total shares bounds; a ticker whose count is unknown passes.
+    pub min_float: f64,
+    pub max_float: f64,
+    pub min_shares: f64,
+    pub max_shares: f64,
 
     /// Window of the Vol/m column. Old files call it `delta_window_seconds`.
     #[serde(alias = "delta_window_seconds")]
     pub vol_m_window_seconds: u64,
-    /// Which panel the rate area shows; `t` toggles it.
-    pub rate_tab: RateTab,
+    /// Colour theme id: "dark-noir" (the original look) or an opaline builtin such as
+    /// "catppuccin-mocha". An unknown id shows Dark Noir.
+    pub theme: String,
+    /// Text size of the app window (GUI), in points. Ctrl+mouse wheel changes it.
+    pub font_size: f32,
+    pub layout: Layout,
+    /// The scrolling ticker tape and the key hints at the bottom of the dashboard.
+    pub ticker_tape: bool,
+    pub key_hints: bool,
+    /// Rows of the dashboard alerts panel (5-15).
+    pub alert_rows: u16,
+    /// Alert sound: silent when muted; volume in percent (0-100).
+    pub sound_muted: bool,
+    pub sound_volume: u8,
+    /// Time zone, date, clock and number formats (Config -> Time & Format).
+    pub formats: crate::fmt::Formats,
     pub blacklisted_tickers: Vec<String>,
     pub filter_enabled: BTreeMap<String, bool>,
     pub column_visibility: BTreeMap<String, bool>,
@@ -110,8 +143,20 @@ impl Default for Config {
             max_volume: 0,
             min_price: 0.0,
             max_price: 0.0,
+            min_float: 0.0,
+            max_float: 0.0,
+            min_shares: 0.0,
+            max_shares: 0.0,
             vol_m_window_seconds: 180,
-            rate_tab: RateTab::default(),
+            theme: "dark-noir".to_string(),
+            font_size: 15.0,
+            layout: Layout::Full,
+            ticker_tape: true,
+            key_hints: true,
+            alert_rows: ALERT_ROWS_MIN,
+            sound_muted: false,
+            sound_volume: 70,
+            formats: crate::fmt::Formats::default(),
             blacklisted_tickers: Vec::new(),
             filter_enabled: FILTER_NAMES.iter().map(|f| (f.to_string(), true)).collect(),
             column_visibility: BTreeMap::new(),
@@ -123,11 +168,43 @@ impl Default for Config {
 }
 
 impl Config {
+    /// The "Recommended" preset (`p` in Configuration): the owner's tuned settings for
+    /// small-cap momentum. Only the Configuration fields change; everything else is kept.
+    pub fn recommended(base: &Config) -> Config {
+        Config {
+            refresh_interval_seconds: 1,
+            min_market_cap: 0.0,
+            max_market_cap: 800_000_000.0,
+            rank_tracking_interval_seconds: 60,
+            recompute_ms: 1000,
+            vol_m_window_seconds: 120,
+            setup_window_sec: 300,
+            setup_vol_ratio: 2.2,
+            setup_price_pct: 10.0,
+            min_volume_for_alert: 10_000,
+            min_price_for_alert: 1.0,
+            alert_cooldown_sec: 120,
+            min_change_percent: 15.0,
+            max_change_percent: 0.0,
+            min_volume: 10_000,
+            max_volume: 0,
+            min_price: 0.3,
+            max_price: 25.0,
+            min_float: 0.0,
+            max_float: 0.0,
+            min_shares: 0.0,
+            max_shares: 0.0,
+            theme: "everforest-dark".to_string(),
+            ..base.clone()
+        }
+    }
+
+    /// The config in `path`, or the defaults when there is none yet. A missing file is not
+    /// written here: the first save (the first-run Configuration) creates it, so a user who
+    /// quits before saving still gets the first-run setup next time.
     pub fn load(path: &Path) -> io::Result<Config> {
         if !path.exists() {
-            let cfg = Config::default();
-            cfg.save(path)?;
-            return Ok(cfg);
+            return Ok(Config::default());
         }
         let data = fs::read_to_string(path)?;
         let mut cfg = Config::from_json(&data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -195,6 +272,9 @@ impl Config {
         } else if self.vol_m_window_seconds < 30 {
             self.vol_m_window_seconds = 30;
         }
+        self.alert_rows = self.alert_rows.clamp(ALERT_ROWS_MIN, ALERT_ROWS_MAX);
+        self.sound_volume = self.sound_volume.min(100);
+        self.formats.validate();
         // The "delta" column became "volrate" (Vol/m).
         if let Some(v) = self.column_visibility.remove("delta") {
             self.column_visibility.entry("volrate".to_string()).or_insert(v);
@@ -208,8 +288,9 @@ impl Config {
         self.filter_enabled.get(name).copied().unwrap_or(true)
     }
 
+    /// Whether a list column is shown; Float and Shares are off until switched on.
     pub fn column_visible(&self, key: &str) -> bool {
-        self.column_visibility.get(key).copied().unwrap_or(true)
+        self.column_visibility.get(key).copied().unwrap_or(!matches!(key, "float" | "shares"))
     }
 }
 
@@ -224,13 +305,12 @@ mod tests {
     }
 
     #[test]
-    fn missing_file_writes_defaults() {
+    fn missing_file_gives_defaults_without_writing() {
         let p = tmp("missing");
         let _ = fs::remove_file(&p);
         let cfg = Config::load(&p).unwrap();
         assert_eq!(cfg, Config::default());
-        assert!(p.exists());
-        fs::remove_file(&p).unwrap();
+        assert!(!p.exists());
     }
 
     #[test]
@@ -364,24 +444,43 @@ mod tests {
     }
 
     #[test]
-    fn rate_tab_defaults_to_highs_lows_and_roundtrips() {
-        assert_eq!(Config::default().rate_tab, RateTab::HighsLows);
-        // an old file without the key gets the default
-        let cfg: Config = serde_json::from_str("{}").unwrap();
-        assert_eq!(cfg.rate_tab, RateTab::HighsLows);
-        // an unknown value does not stop the file from loading
-        let cfg: Config = serde_json::from_str(r#"{"rate_tab":"bogus"}"#).unwrap();
-        assert_eq!(cfg.rate_tab, RateTab::HighsLows);
+    fn old_rate_tab_key_is_ignored() {
+        let cfg: Config = serde_json::from_str(r#"{"rate_tab":"ticks"}"#).unwrap();
+        assert_eq!(cfg, Config::default());
+    }
 
-        let p = tmp("rate_tab");
-        let cfg = Config { rate_tab: Config::default().rate_tab.toggled(), ..Config::default() };
-        assert_eq!(cfg.rate_tab, RateTab::Ticks);
-        cfg.save(&p).unwrap();
-        assert!(fs::read_to_string(&p).unwrap().contains(r#""rate_tab": "ticks""#));
-        let back = Config::load(&p).unwrap();
-        assert_eq!(back.rate_tab, RateTab::Ticks);
-        assert_eq!(back.rate_tab.toggled(), RateTab::HighsLows);
+    #[test]
+    fn layout_toggles_and_alert_rows() {
+        let c: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!((c.layout, c.ticker_tape, c.key_hints, c.alert_rows), (Layout::Full, true, true, 5));
+        let mut c = Config::from_json(r#"{"layout":"alerts","ticker_tape":false,"alert_rows":40}"#).unwrap();
+        c.validate();
+        assert_eq!((c.layout, c.ticker_tape, c.key_hints, c.alert_rows), (Layout::Alerts, false, true, 15));
+        assert_eq!(Layout::Alerts.next(), Layout::Full);
+        assert_eq!(Layout::Full.next(), Layout::List);
+    }
+
+    #[test]
+    fn formats_default_validate_and_roundtrip() {
+        let c: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(c.formats, crate::fmt::Formats::default());
+        let mut c = Config::from_json(r#"{"formats":{"timezone":"Nowhere","date":"YYYY-MM-DD","clock_12h":true}}"#).unwrap();
+        c.validate();
+        assert_eq!((c.formats.timezone.as_str(), c.formats.date.as_str(), c.formats.clock_12h), ("Local", "YYYY-MM-DD", true));
+        let p = tmp("formats");
+        c.save(&p).unwrap();
+        assert_eq!(Config::load(&p).unwrap(), c);
         fs::remove_file(&p).unwrap();
+    }
+
+    #[test]
+    fn float_columns_off_and_filters_zero_by_default() {
+        let c: Config = serde_json::from_str("{}").unwrap();
+        assert!(!c.column_visible("float") && !c.column_visible("shares") && c.column_visible("mcap"));
+        assert_eq!((c.min_float, c.max_float, c.min_shares, c.max_shares), (0.0, 0.0, 0.0, 0.0));
+        let c = Config::from_json(r#"{"column_visibility":{"float":true},"max_float":20000000}"#).unwrap();
+        assert!(c.column_visible("float") && !c.column_visible("shares"));
+        assert_eq!(c.max_float, 2e7);
     }
 
     #[test]
