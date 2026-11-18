@@ -66,10 +66,7 @@ pub fn disk(_path: &std::path::Path) -> Option<(u64, u64)> {
 pub fn os_version() -> Option<String> {
     use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
     use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
-    let mut v = OSVERSIONINFOW {
-        dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
-        ..Default::default()
-    };
+    let mut v = OSVERSIONINFOW { dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32, ..Default::default() };
     // SAFETY: `v` is a valid OSVERSIONINFOW with its size field set; RtlGetVersion only fills it.
     if unsafe { RtlGetVersion(&mut v) } != 0 {
         return None;

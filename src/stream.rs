@@ -6,10 +6,11 @@
 //! Anonymous access (user/pass `test`/`test`) only delivers type 102 with flag "1".
 
 use crate::app::Msg;
-use crate::scraper::USER_AGENT;
+use crate::net::USER_AGENT;
 use crate::session::Session;
+use crate::trace::{tlog, tnote};
 use chrono::{DateTime, Utc};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::net::{TcpStream, ToSocketAddrs};
@@ -42,7 +43,7 @@ pub enum Cmd {
 /// One decoded quote message. Numbers the server sent as strings are parsed; absent or
 /// unparseable values are `None`.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // high/low/status are consumed by later steps (series store, highs/lows, status).
+#[allow(dead_code)] // high/low/status are decoded (and tested) but nothing reads them yet
 pub struct Update {
     pub id: u64,
     /// Exchange timestamp in ms (0 if absent).
@@ -73,136 +74,17 @@ pub struct StreamStatus {
     pub error: Option<String>,
 }
 
-// ───────────────────────────── MQTT 3.1.1 ─────────────────────────────
+mod mqtt;
+mod proto;
+#[cfg(test)]
+mod tests;
 
-#[derive(Debug, PartialEq)]
-pub enum Packet {
-    ConnAck { code: u8 },
-    SubAck { id: u16, codes: Vec<u8> },
-    Publish { topic: String, payload: Vec<u8> },
-    PingResp,
-    Other(u8),
-}
-
-fn put_str(out: &mut Vec<u8>, s: &str) {
-    out.extend_from_slice(&(s.len() as u16).to_be_bytes());
-    out.extend_from_slice(s.as_bytes());
-}
-
-fn put_remaining(out: &mut Vec<u8>, mut n: usize) {
-    loop {
-        let mut b = (n % 128) as u8;
-        n /= 128;
-        if n > 0 {
-            b |= 0x80;
-        }
-        out.push(b);
-        if n == 0 {
-            break;
-        }
-    }
-}
-
-fn frame(first: u8, body: Vec<u8>) -> Vec<u8> {
-    let mut out = vec![first];
-    put_remaining(&mut out, body.len());
-    out.extend(body);
-    out
-}
-
-pub fn encode_connect(client_id: &str, user: &str, pass: &str, keepalive: u16) -> Vec<u8> {
-    let mut b = Vec::new();
-    put_str(&mut b, "MQTT");
-    b.push(4); // protocol level 3.1.1
-    b.push(0xC2); // username, password, clean session
-    b.extend_from_slice(&keepalive.to_be_bytes());
-    put_str(&mut b, client_id);
-    put_str(&mut b, user);
-    put_str(&mut b, pass);
-    frame(0x10, b)
-}
-
-pub fn encode_subscribe(id: u16, topic: &str) -> Vec<u8> {
-    let mut b = id.to_be_bytes().to_vec();
-    put_str(&mut b, topic);
-    b.push(0); // QoS 0
-    frame(0x82, b)
-}
-
-pub fn encode_unsubscribe(id: u16, topic: &str) -> Vec<u8> {
-    let mut b = id.to_be_bytes().to_vec();
-    put_str(&mut b, topic);
-    frame(0xA2, b)
-}
-
-pub fn encode_pingreq() -> Vec<u8> {
-    vec![0xC0, 0x00]
-}
-
-/// Removes every complete packet from the front of `buf` and returns them.
-/// A trailing partial packet is left in `buf` for the next call.
-pub fn parse_packets(buf: &mut Vec<u8>) -> Result<Vec<Packet>, String> {
-    let mut out = Vec::new();
-    let mut pos = 0;
-    loop {
-        let rest = &buf[pos..];
-        if rest.len() < 2 {
-            break;
-        }
-        let mut len = 0usize;
-        let mut mult = 1usize;
-        let mut i = 1;
-        let header = loop {
-            let Some(&b) = rest.get(i) else { break None };
-            len += (b & 0x7F) as usize * mult;
-            i += 1;
-            if b & 0x80 == 0 {
-                break Some(i);
-            }
-            mult *= 128;
-            if mult > 128 * 128 * 128 {
-                return Err("malformed remaining length".into());
-            }
-        };
-        let Some(header) = header else { break };
-        if rest.len() < header + len {
-            break;
-        }
-        let first = rest[0];
-        out.push(parse_packet(first, &rest[header..header + len])?);
-        pos += header + len;
-    }
-    buf.drain(..pos);
-    Ok(out)
-}
-
-fn parse_packet(first: u8, body: &[u8]) -> Result<Packet, String> {
-    let short = || "truncated packet".to_string();
-    let u16_at = |i: usize| -> Result<u16, String> {
-        Ok(u16::from_be_bytes([*body.get(i).ok_or_else(short)?, *body.get(i + 1).ok_or_else(short)?]))
-    };
-    Ok(match first >> 4 {
-        2 => Packet::ConnAck { code: *body.get(1).ok_or_else(short)? },
-        9 => Packet::SubAck { id: u16_at(0)?, codes: body.get(2..).unwrap_or(&[]).to_vec() },
-        13 => Packet::PingResp,
-        3 => {
-            let qos = (first >> 1) & 3;
-            let tlen = u16_at(0)? as usize;
-            let topic = body.get(2..2 + tlen).ok_or_else(short)?;
-            let start = 2 + tlen + if qos > 0 { 2 } else { 0 };
-            Packet::Publish {
-                topic: String::from_utf8_lossy(topic).into_owned(),
-                payload: body.get(start..).ok_or_else(short)?.to_vec(),
-            }
-        }
-        t => Packet::Other(t),
-    })
-}
+use mqtt::*;
+pub use proto::RawMsg;
+use proto::*;
 
 fn header_topic(did: &str) -> String {
-    format!(
-        r#"{{"header":{{"did":"{did}","hl":"en","app":"global","os":"web","osv":"h5","ver":"1.0.0","platform":"webull-us"}}}}"#
-    )
+    format!(r#"{{"header":{{"did":"{did}","hl":"en","app":"global","os":"web","osv":"h5","ver":"1.0.0","platform":"webull-us"}}}}"#)
 }
 
 fn tickers_topic(ids: &[u64]) -> String {
@@ -210,207 +92,36 @@ fn tickers_topic(ids: &[u64]) -> String {
     format!(r#"{{"tickerIds":[{}],"type":"102","flag":"1"}}"#, list.join(","))
 }
 
-// ───────────────────────────── protobuf ─────────────────────────────
-
-enum Val<'a> {
-    Varint(u64),
-    Bytes(&'a [u8]),
-    Other,
-}
-
-/// Iterates the (field number, value) pairs of one protobuf message. Yields `Err` once on malformed input.
-struct Fields<'a> {
-    buf: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Fields<'a> {
-    fn new(buf: &'a [u8]) -> Self {
-        Fields { buf, pos: 0 }
-    }
-
-    fn varint(&mut self) -> Option<u64> {
-        let mut v = 0u64;
-        for shift in (0..70).step_by(7) {
-            let b = *self.buf.get(self.pos)?;
-            self.pos += 1;
-            v |= ((b & 0x7F) as u64).checked_shl(shift).unwrap_or(0);
-            if b & 0x80 == 0 {
-                return Some(v);
-            }
-        }
-        None
-    }
-
-    fn skip(&mut self, n: usize) -> Option<()> {
-        let end = self.pos.checked_add(n).filter(|&e| e <= self.buf.len())?;
-        self.pos = end;
-        Some(())
-    }
-}
-
-impl<'a> Iterator for Fields<'a> {
-    type Item = Result<(u32, Val<'a>), ()>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.pos >= self.buf.len() {
-            return None;
-        }
-        let item = (|| {
-            let key = self.varint()?;
-            let field = (key >> 3) as u32;
-            let val = match key & 7 {
-                0 => Val::Varint(self.varint()?),
-                1 => self.skip(8).map(|_| Val::Other)?,
-                5 => self.skip(4).map(|_| Val::Other)?,
-                2 => {
-                    let n = self.varint()? as usize;
-                    let start = self.pos;
-                    self.skip(n)?;
-                    Val::Bytes(&self.buf[start..start + n])
-                }
-                _ => return None,
-            };
-            Some((field, val))
-        })();
-        match item {
-            Some(x) => Some(Ok(x)),
-            None => {
-                self.pos = self.buf.len();
-                Some(Err(()))
-            }
-        }
-    }
-}
-
-fn text_num(b: &[u8]) -> Option<f64> {
-    let s = std::str::from_utf8(b).ok()?.replace(',', "");
-    s.trim().parse::<f64>().ok().filter(|v| v.is_finite())
-}
-
-/// Decodes a PUBLISH payload (`ItemsCombo`). `topic_id` is the tickerId from the topic JSON,
-/// used when the payload's BaseItem lacks one. Returns `None` for malformed payloads or when no id is known.
-pub fn decode_items_combo(buf: &[u8], topic_id: Option<u64>) -> Option<Update> {
-    let mut u = Update {
-        id: topic_id.unwrap_or(0),
-        trade_ms: 0,
-        seq: 0,
-        close: None,
-        p_price: None,
-        change_ratio: None,
-        volume: None,
-        mcap: None,
-        high: None,
-        low: None,
-        status: String::new(),
-        recv: Instant::now(),
-    };
-    for f in Fields::new(buf) {
-        let (field, val) = f.ok()?;
-        let Val::Bytes(sub) = val else { continue };
-        match field {
-            1 => {
-                for f in Fields::new(sub) {
-                    match f.ok()? {
-                        (2, Val::Varint(v)) => u.seq = v,
-                        (3, Val::Varint(v)) if v != 0 => u.id = v,
-                        (4, Val::Bytes(b)) => u.status = String::from_utf8_lossy(b).into_owned(),
-                        (5, Val::Varint(v)) => u.trade_ms = v as i64,
-                        _ => {}
-                    }
-                }
-            }
-            2 => {
-                for f in Fields::new(sub) {
-                    match f.ok()? {
-                        (1, Val::Bytes(b)) => u.close = text_num(b),
-                        (3, Val::Bytes(b)) => u.change_ratio = text_num(b),
-                        (4, Val::Bytes(b)) => u.p_price = text_num(b),
-                        (7, Val::Bytes(b)) => u.mcap = text_num(b),
-                        _ => {}
-                    }
-                }
-            }
-            3 => {
-                for f in Fields::new(sub) {
-                    match f.ok()? {
-                        (3, Val::Bytes(b)) => u.volume = text_num(b).filter(|v| *v >= 0.0).map(|v| v.round() as u64),
-                        (9, Val::Bytes(b)) => u.high = text_num(b),
-                        (10, Val::Bytes(b)) => u.low = text_num(b),
-                        _ => {}
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    (u.id != 0).then_some(u)
-}
-
-/// Every field of one message as the server sent it, keyed by protobuf field number and rendered
-/// as text. Probe mode records these untouched, including fields the app does not use.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct RawMsg {
-    pub id: u64,
-    /// BaseItem (field 1 of ItemsCombo).
-    pub base: BTreeMap<u32, String>,
-    /// SaleItem (field 2).
-    pub sale: BTreeMap<u32, String>,
-    /// StatsItem (field 3).
-    pub stats: BTreeMap<u32, String>,
-    /// Other top-level modules present: (field number, payload length).
-    pub modules: Vec<(u32, usize)>,
-}
-
-fn raw_text(v: &Val) -> String {
-    match v {
-        Val::Varint(n) => n.to_string(),
-        Val::Bytes(b) => match std::str::from_utf8(b) {
-            Ok(s) if !s.chars().any(char::is_control) => s.to_string(),
-            _ => b.iter().map(|x| format!("{x:02x}")).collect(),
-        },
-        Val::Other => "<fixed>".to_string(),
-    }
-}
-
-fn raw_fields(buf: &[u8]) -> Option<BTreeMap<u32, String>> {
-    let mut m = BTreeMap::new();
-    for f in Fields::new(buf) {
-        let (n, v) = f.ok()?;
-        m.insert(n, raw_text(&v));
-    }
-    Some(m)
-}
-
-/// Like `decode_items_combo`, but keeps all raw fields as text. `None` for malformed payloads or when no id is known.
-pub fn decode_raw(buf: &[u8], topic_id: Option<u64>) -> Option<RawMsg> {
-    let mut m = RawMsg::default();
-    for f in Fields::new(buf) {
-        let (field, val) = f.ok()?;
-        let Val::Bytes(sub) = val else { continue };
-        match field {
-            1 => m.base = raw_fields(sub)?,
-            2 => m.sale = raw_fields(sub)?,
-            3 => m.stats = raw_fields(sub)?,
-            n => m.modules.push((n, sub.len())),
-        }
-    }
-    m.id = m.base.get(&3).and_then(|v| v.parse().ok()).filter(|&v| v != 0).or(topic_id).unwrap_or(0);
-    (m.id != 0).then_some(m)
-}
-
 /// Diagnostics for probe mode, sent with the wall-clock time they happened.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     /// WebSocket, CONNECT and the header subscription all succeeded; `n` counts connections so far.
-    Connected { n: u64 },
+    Connected {
+        n: u64,
+    },
     /// A SUBSCRIBE (or UNSUBSCRIBE) packet was sent for `count` tickers; `total` is the number held afterwards.
-    Subscribe { id: u16, count: usize, total: usize },
-    Unsubscribe { id: u16, count: usize, total: usize },
+    Subscribe {
+        id: u16,
+        count: usize,
+        total: usize,
+    },
+    Unsubscribe {
+        id: u16,
+        count: usize,
+        total: usize,
+    },
     /// Return codes of a SUBACK (0 = QoS 0 granted, 0x80 = refused).
-    SubAck { id: u16, codes: Vec<u8> },
-    Disconnected { reason: String },
-    Undecodable { topic: String, len: usize },
+    SubAck {
+        id: u16,
+        codes: Vec<u8>,
+    },
+    Disconnected {
+        reason: String,
+    },
+    Undecodable {
+        topic: String,
+        len: usize,
+    },
     Raw(RawMsg),
 }
 
@@ -483,9 +194,7 @@ impl Conn {
             }
             Ok(Message::Close(_)) => Err("server closed the connection".into()),
             Ok(_) => Ok(Vec::new()),
-            Err(tungstenite::Error::Io(e)) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
-                Ok(Vec::new())
-            }
+            Err(tungstenite::Error::Io(e)) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => Ok(Vec::new()),
             Err(e) => Err(format!("read: {e}")),
         }
     }
@@ -578,6 +287,7 @@ fn supervise(sh: &mut Shared) {
             }
         }
         let mut got_data = false;
+        tlog!("stream", "dialling for {} tickers", sh.wanted.len());
         let err = match run_connection(sh, &tls, &mut got_data) {
             Ok(()) => return, // app gone
             Err(e) => e,
@@ -589,6 +299,7 @@ fn supervise(sh: &mut Shared) {
         if got_data {
             backoff = Duration::from_secs(1);
         }
+        tlog!("stream", "disconnected: {} (retry in {} s)", sh.st.error.as_deref().unwrap_or(""), backoff.as_secs());
         if !wait(sh, backoff, true) {
             return;
         }
@@ -630,7 +341,9 @@ fn run_connection(sh: &mut Shared, tls: &Arc<rustls::ClientConfig>, got_data: &m
     // The header topic has to be subscribed before any ticker topic.
     let id = c.id();
     c.send(encode_subscribe(id, &header_topic(&sh.did)))?;
-    if let Packet::SubAck { codes, .. } = c.wait_for("SUBACK", CONNECT_TIMEOUT, |p| matches!(p, Packet::SubAck { id: i, .. } if *i == id))? {
+    if let Packet::SubAck { codes, .. } =
+        c.wait_for("SUBACK", CONNECT_TIMEOUT, |p| matches!(p, Packet::SubAck { id: i, .. } if *i == id))?
+    {
         sh.event(|| Event::SubAck { id, codes });
     }
 
@@ -639,6 +352,7 @@ fn run_connection(sh: &mut Shared, tls: &Arc<rustls::ClientConfig>, got_data: &m
     sh.st.error = None;
     sh.st.last_msg = None;
     sh.event(|| Event::Connected { n: sh.st.connections });
+    tlog!("stream", "connected #{}", sh.st.connections);
     // Sent before any quote of this connection so the app can drop state from the previous one.
     if !sh.emit() {
         return Ok(());
@@ -670,6 +384,9 @@ fn run_connection(sh: &mut Shared, tls: &Arc<rustls::ClientConfig>, got_data: &m
             subscribed.extend(chunk);
             sh.event(|| Event::Subscribe { id, count: chunk.len(), total: subscribed.len() });
         }
+        if !add.is_empty() || !del.is_empty() {
+            tlog!("stream.subs", "+{} -{}, {} held", add.len(), del.len(), subscribed.len());
+        }
         sh.st.subs = subscribed.len();
 
         for p in c.poll()? {
@@ -697,6 +414,9 @@ fn run_connection(sh: &mut Shared, tls: &Arc<rustls::ClientConfig>, got_data: &m
         let now = Instant::now();
         if now.duration_since(last_batch) >= BATCH {
             last_batch = now;
+            if !batch.is_empty() {
+                tnote!("stream.batch", "{} quotes", batch.len());
+            }
             if !batch.is_empty() && sh.tx.send(Msg::Quotes(std::mem::take(&mut batch))).is_err() {
                 return Ok(());
             }
@@ -707,6 +427,7 @@ fn run_connection(sh: &mut Shared, tls: &Arc<rustls::ClientConfig>, got_data: &m
         }
         if now.duration_since(last_status) >= STATUS_EVERY {
             sh.st.msgs_per_sec = count as f64 / now.duration_since(window_start).as_secs_f64().max(0.001);
+            tnote!("stream.rate", "{count} quotes/s, {} subs", subscribed.len());
             count = 0;
             window_start = now;
             last_status = now;
@@ -718,205 +439,5 @@ fn run_connection(sh: &mut Shared, tls: &Arc<rustls::ClientConfig>, got_data: &m
         if !subscribed.is_empty() && now.duration_since(silent_since) > STALE && Session::now() != Session::Closed {
             return Err("no data from stream".into());
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ---- MQTT ----
-
-    #[test]
-    fn connect_packet_bytes() {
-        let p = encode_connect("ab", "u", "p", 30);
-        let expect: Vec<u8> = vec![
-            0x10, 0x14, // CONNECT, remaining 20
-            0, 4, b'M', b'Q', b'T', b'T', 4, 0xC2, 0, 30, // protocol, level, flags, keepalive
-            0, 2, b'a', b'b', // client id
-            0, 1, b'u', // user
-            0, 1, b'p', // password
-        ];
-        assert_eq!(p, expect);
-    }
-
-    #[test]
-    fn subscribe_unsubscribe_ping_bytes() {
-        assert_eq!(encode_subscribe(1, "hi"), vec![0x82, 7, 0, 1, 0, 2, b'h', b'i', 0]);
-        assert_eq!(encode_unsubscribe(258, "x"), vec![0xA2, 5, 1, 2, 0, 1, b'x']);
-        assert_eq!(encode_pingreq(), vec![0xC0, 0]);
-    }
-
-    #[test]
-    fn remaining_length_multi_byte() {
-        let topic = "t".repeat(200);
-        let p = encode_subscribe(1, &topic);
-        // body = 2 + 2 + 200 + 1 = 205 -> 0xCD 0x01
-        assert_eq!(&p[..3], &[0x82, 0xCD, 0x01]);
-        assert_eq!(p.len(), 3 + 205);
-    }
-
-    #[test]
-    fn parses_connack_suback_pingresp() {
-        let mut buf = vec![0x20, 2, 0, 0, 0x90, 3, 0, 7, 0, 0xD0, 0];
-        let pk = parse_packets(&mut buf).unwrap();
-        assert_eq!(pk, vec![Packet::ConnAck { code: 0 }, Packet::SubAck { id: 7, codes: vec![0] }, Packet::PingResp]);
-        assert!(buf.is_empty());
-    }
-
-    #[test]
-    fn parses_publish_qos0_and_qos1() {
-        let mut buf = vec![0x30, 7, 0, 2, b't', b'p', 1, 2, 3];
-        assert_eq!(
-            parse_packets(&mut buf).unwrap(),
-            vec![Packet::Publish { topic: "tp".into(), payload: vec![1, 2, 3] }]
-        );
-        // QoS 1 carries a packet id after the topic.
-        let mut buf = vec![0x32, 8, 0, 2, b't', b'p', 0, 9, 4, 5];
-        assert_eq!(
-            parse_packets(&mut buf).unwrap(),
-            vec![Packet::Publish { topic: "tp".into(), payload: vec![4, 5] }]
-        );
-    }
-
-    #[test]
-    fn partial_packets_stay_buffered() {
-        let mut buf = vec![0x30, 7, 0, 2, b't'];
-        assert!(parse_packets(&mut buf).unwrap().is_empty());
-        assert_eq!(buf.len(), 5);
-        buf.extend_from_slice(&[b'p', 1, 2, 3, 0xD0, 0]);
-        let pk = parse_packets(&mut buf).unwrap();
-        assert_eq!(pk.len(), 2);
-        assert!(buf.is_empty());
-        // length header itself incomplete
-        let mut buf = vec![0x30, 0x80];
-        assert!(parse_packets(&mut buf).unwrap().is_empty());
-        assert_eq!(buf.len(), 2);
-    }
-
-    #[test]
-    fn rejects_bad_input() {
-        let mut buf = vec![0x30, 0xFF, 0xFF, 0xFF, 0xFF, 0x01];
-        assert!(parse_packets(&mut buf).is_err());
-        let mut buf = vec![0x20, 1, 0]; // CONNACK too short
-        assert!(parse_packets(&mut buf).is_err());
-    }
-
-    #[test]
-    fn topic_strings() {
-        assert_eq!(tickers_topic(&[1, 22]), r#"{"tickerIds":[1,22],"type":"102","flag":"1"}"#);
-        assert!(header_topic("abc").starts_with(r#"{"header":{"did":"abc","hl":"en""#));
-        assert_eq!(topic_ticker_id(r#"{"type":102,"tickerId":950978197,"modules":[""],"flag":"1"}"#), Some(950978197));
-        assert_eq!(topic_ticker_id("garbage"), None);
-    }
-
-    // ---- protobuf ----
-
-    fn varint(mut v: u64) -> Vec<u8> {
-        let mut out = Vec::new();
-        loop {
-            let b = (v & 0x7F) as u8;
-            v >>= 7;
-            if v == 0 {
-                out.push(b);
-                return out;
-            }
-            out.push(b | 0x80);
-        }
-    }
-    fn f_varint(field: u32, v: u64) -> Vec<u8> {
-        [varint((field as u64) << 3), varint(v)].concat()
-    }
-    fn f_bytes(field: u32, b: &[u8]) -> Vec<u8> {
-        [varint(((field as u64) << 3) | 2), varint(b.len() as u64), b.to_vec()].concat()
-    }
-    fn f_str(field: u32, s: &str) -> Vec<u8> {
-        f_bytes(field, s.as_bytes())
-    }
-
-    fn sample() -> Vec<u8> {
-        let base = [f_varint(1, 5), f_varint(2, 77), f_varint(3, 950978197), f_str(4, "T"), f_varint(5, 1_763_400_000_123), f_varint(8, 9)].concat();
-        let sale = [f_str(1, "1.25"), f_str(2, "0.25"), f_str(3, "0.25"), f_str(4, "1.30"), f_str(7, "12,500,000")].concat();
-        let stats = [f_str(1, "1763400000"), f_str(3, "1234567"), f_str(8, "1.0"), f_str(9, "1.4"), f_str(10, "0.9"), f_varint(52, 3)].concat();
-        [f_bytes(1, &base), f_bytes(2, &sale), f_bytes(3, &stats), f_bytes(6, b"ignored")].concat()
-    }
-
-    #[test]
-    fn decodes_items_combo() {
-        let u = decode_items_combo(&sample(), None).unwrap();
-        assert_eq!(u.id, 950978197);
-        assert_eq!(u.seq, 77);
-        assert_eq!(u.trade_ms, 1_763_400_000_123);
-        assert_eq!(u.status, "T");
-        assert_eq!(u.close, Some(1.25));
-        assert_eq!(u.p_price, Some(1.30));
-        assert_eq!(u.change_ratio, Some(0.25));
-        assert_eq!(u.mcap, Some(12_500_000.0));
-        assert_eq!(u.volume, Some(1_234_567));
-        assert_eq!(u.high, Some(1.4));
-        assert_eq!(u.low, Some(0.9));
-    }
-
-    #[test]
-    fn raw_decode_keeps_every_field_as_text() {
-        let m = decode_raw(&sample(), None).unwrap();
-        assert_eq!(m.id, 950978197);
-        assert_eq!(m.base.get(&1).map(String::as_str), Some("5"));
-        assert_eq!(m.base.get(&4).map(String::as_str), Some("T"));
-        assert_eq!(m.base.get(&5).map(String::as_str), Some("1763400000123"));
-        assert_eq!(m.base.get(&8).map(String::as_str), Some("9")); // unknown field kept
-        assert_eq!(m.sale.get(&7).map(String::as_str), Some("12,500,000")); // not normalised
-        assert_eq!(m.stats.get(&52).map(String::as_str), Some("3"));
-        assert_eq!(m.modules, vec![(6, 7)]);
-    }
-
-    #[test]
-    fn raw_decode_id_fallback_and_rejects() {
-        let buf = f_bytes(3, &f_str(3, "10"));
-        assert_eq!(decode_raw(&buf, Some(7)).unwrap().id, 7);
-        assert!(decode_raw(&buf, None).is_none());
-        let mut b = sample();
-        b.truncate(b.len() - 3);
-        assert!(decode_raw(&b, Some(1)).is_none());
-        // binary string field is hex-encoded
-        let buf = f_bytes(2, &f_bytes(9, &[0xFF, 0x01]));
-        assert_eq!(decode_raw(&buf, Some(1)).unwrap().sale.get(&9).map(String::as_str), Some("ff01"));
-    }
-
-    #[test]
-    fn missing_and_bad_numbers_are_none() {
-        let sale = [f_str(1, ""), f_str(4, "n/a")].concat();
-        let stats = f_str(3, "-5");
-        let buf = [f_bytes(1, &f_varint(3, 42)), f_bytes(2, &sale), f_bytes(3, &stats)].concat();
-        let u = decode_items_combo(&buf, None).unwrap();
-        assert_eq!(u.id, 42);
-        assert_eq!((u.close, u.p_price, u.volume), (None, None, None));
-    }
-
-    #[test]
-    fn id_falls_back_to_topic_and_is_required() {
-        let buf = f_bytes(3, &f_str(3, "10"));
-        assert_eq!(decode_items_combo(&buf, Some(7)).unwrap().id, 7);
-        assert!(decode_items_combo(&buf, None).is_none());
-    }
-
-    #[test]
-    fn truncated_or_garbage_protobuf_is_rejected() {
-        let mut b = sample();
-        b.truncate(b.len() - 3);
-        assert!(decode_items_combo(&b, Some(1)).is_none());
-        assert!(decode_items_combo(&[0x0B], Some(1)).is_none()); // group wire type
-        assert!(decode_items_combo(&[0x80; 12], Some(1)).is_none()); // endless varint
-    }
-
-    #[test]
-    fn unknown_wire_types_are_skipped() {
-        // fixed64 (field 9) and fixed32 (field 10) at top level, then a valid base
-        let mut b = vec![(9 << 3) | 1];
-        b.extend([0u8; 8]);
-        b.push((10 << 3) | 5);
-        b.extend([0u8; 4]);
-        b.extend(f_bytes(1, &f_varint(3, 5)));
-        assert_eq!(decode_items_combo(&b, None).unwrap().id, 5);
     }
 }

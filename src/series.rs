@@ -126,7 +126,7 @@ impl SeriesStore {
 
     /// Number of all-series clears so far (session/date change, reconnect). Other state that
     /// must reset at the same moments (rank ring, badges) can watch this counter.
-    #[allow(dead_code)] // for resetting cooldown/badge state with the series
+    #[cfg(test)]
     pub fn resets(&self) -> u64 {
         self.resets
     }
@@ -265,12 +265,12 @@ impl SeriesStore {
         self.map.get(&id)?.pts.front().copied()
     }
 
-    #[allow(dead_code)] // only tests read this
+    #[cfg(test)]
     pub fn latest(&self, id: u64) -> Option<Sample> {
         self.map.get(&id)?.pts.back().copied()
     }
 
-    #[allow(dead_code)] // only tests read this
+    #[cfg(test)]
     pub fn len(&self, id: u64) -> usize {
         self.map.get(&id).map_or(0, |s| s.pts.len())
     }
@@ -422,7 +422,7 @@ mod tests {
         let oldest = st.oldest(1).unwrap();
         assert!(oldest.t <= now - Duration::from_secs(120));
         assert!(oldest.t > now - Duration::from_secs(122)); // anchor within a second of the horizon
-        // lookup at exactly now - horizon still resolves
+                                                            // lookup at exactly now - horizon still resolves
         assert!(st.vol_at(1, now - Duration::from_secs(120)).is_some());
         assert_eq!(st.len(1), 121);
     }
@@ -462,7 +462,7 @@ mod tests {
     fn closed_gaps_rank_between_sessions() {
         let (mut st, t0) = store();
         st.ingest(s(1, ms(19, 59, 0), 1, 1.0, 100, t0)); // After
-        // 20:01 same day (Closed) is later than After: clears
+                                                         // 20:01 same day (Closed) is later than After: clears
         assert_eq!(st.ingest(s(1, ms(20, 1, 0), 1, 1.0, 100, secs(t0, 2))), Ingest::Stored);
         assert_eq!(st.resets(), 1);
         // 21:00 same Closed period: no clear

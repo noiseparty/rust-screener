@@ -5,9 +5,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::time::Duration;
 
-pub const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const API: &str = "https://quotes-gw.webullfintech.com/api/bgw/market/pcIndex?regionId=6&pageSize=";
 const QUOTE_API: &str = "https://quotes-gw.webullfintech.com/api/bgw/quote/realtime?ids=";
 /// Ticker ids per float request.
@@ -39,7 +37,8 @@ pub struct Ticker {
     pub mov: Mov,
     /// Row no longer passes a display filter and is on its way out (dimmed).
     pub dim: bool,
-    pub status: String,
+    /// Alert badge shown in the Status column (set by the engine).
+    pub status: Option<crate::engine::AlertKind>,
 }
 
 /// Rank change of a ticker on the full gainers board over the tracking interval.
@@ -60,27 +59,15 @@ pub struct Fetched {
     pub session: Session,
 }
 
-pub fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(10))
-        .user_agent(USER_AGENT)
-        .build()
-}
-
 pub fn fetch_top_gainers(agent: &ureq::Agent, page_size: usize) -> Result<Fetched, String> {
-    let body: Value = crate::limiter::get(agent, &format!("{API}{page_size}"))?
-        .into_json()
-        .map_err(|e| e.to_string())?;
+    let body = crate::net::get_json(agent, &format!("{API}{page_size}"))?;
     let session = Session::now();
     parse(&body, session)
 }
 
 pub fn parse(body: &Value, session: Session) -> Result<Fetched, String> {
-    let groups = body
-        .get("groups")
-        .or_else(|| body.get("data"))
-        .and_then(Value::as_array)
-        .ok_or("could not find groups or data in response")?;
+    let groups =
+        body.get("groups").or_else(|| body.get("data")).and_then(Value::as_array).ok_or("could not find groups or data in response")?;
 
     let mut found: Option<(&Vec<Value>, String)> = None;
     'outer: for target in session.group_targets() {
@@ -89,18 +76,14 @@ pub fn parse(body: &Value, session: Session) -> Result<Fetched, String> {
             if !name.trim().to_lowercase().contains(target) {
                 continue;
             }
-            let items = g
-                .get("data")
-                .and_then(Value::as_array)
-                .or_else(|| g.get("items").and_then(Value::as_array));
+            let items = g.get("data").and_then(Value::as_array).or_else(|| g.get("items").and_then(Value::as_array));
             if let Some(items) = items.filter(|i| !i.is_empty()) {
                 found = Some((items, name.to_string()));
                 break 'outer;
             }
         }
     }
-    let (items, group) =
-        found.ok_or_else(|| format!("no gainers group for session {}", session.code()))?;
+    let (items, group) = found.ok_or_else(|| format!("no gainers group for session {}", session.code()))?;
 
     let tickers = items
         .iter()
@@ -144,7 +127,7 @@ pub struct Float {
 pub fn fetch_floats(agent: &ureq::Agent, ids: &[u64]) -> Result<Vec<(u64, f64, f64)>, String> {
     let ids: Vec<String> = ids.iter().map(u64::to_string).collect();
     let url = format!("{QUOTE_API}{}&includeSecu=1&delay=0&more=1", ids.join(","));
-    let body: Value = crate::limiter::get(agent, &url)?.into_json().map_err(|e| e.to_string())?;
+    let body = crate::net::get_json(agent, &url)?;
     parse_floats(&body)
 }
 
@@ -247,7 +230,10 @@ mod tests {
             {"symbol": "NOID"}
         ]);
         let rows = parse_floats(&body).unwrap();
-        assert_eq!(rows, vec![(950155382, 1_297_073.0, 2_100_709.0), (913256135, 14_272_214_729.0, 14_532_182_000.0), (913243251, 0.0, 0.0)]);
+        assert_eq!(
+            rows,
+            vec![(950155382, 1_297_073.0, 2_100_709.0), (913256135, 14_272_214_729.0, 14_532_182_000.0), (913243251, 0.0, 0.0)]
+        );
         assert!(parse_floats(&json!({"code": 403})).is_err());
     }
 

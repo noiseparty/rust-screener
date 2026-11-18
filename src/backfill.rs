@@ -4,9 +4,7 @@
 
 use crate::engine::Candle;
 use crate::history::{self, Tf};
-use crate::store::ny_date;
-use chrono::TimeZone;
-use chrono_tz::America::New_York;
+use crate::nytime::{self, date as ny_date};
 
 /// Minutes looked back before the first candle we hold.
 pub const MINUTES: i64 = 10;
@@ -31,7 +29,7 @@ impl Job {
 /// else that day's 04:00. None when there is no gap.
 pub fn gap_from(saved: i64, first_live: i64) -> Option<i64> {
     let day = ny_date(first_live);
-    let open = New_York.from_local_datetime(&day.and_hms_opt(4, 0, 0)?).single()?.timestamp();
+    let open = nytime::ts(day, 4, 0)?;
     let from = if ny_date(saved) == day { (saved + 60).max(open) } else { open };
     (from < first_live).then_some(from)
 }
@@ -42,24 +40,14 @@ pub fn gap_from(saved: i64, first_live: i64) -> Option<i64> {
 pub fn fetch(agent: &ureq::Agent, job: &Job) -> (Vec<Candle>, bool) {
     let date = ny_date(job.before);
     let mut out = Vec::new();
-    let mut failed = false;
     // The bar ending at `before` is the last minute that started before it.
-    let mut ts = job.before;
-    loop {
-        let c = match history::try_bar_at(agent, job.ticker_id, Tf::M1, ts) {
-            Ok(Some(c)) => c,
-            Ok(None) => break,
-            Err(()) => {
-                failed = true;
-                break;
-            }
-        };
-        if c.start < job.from || c.start >= job.before || ny_date(c.start) != date {
-            break;
+    let failed = history::walk_back(agent, job.ticker_id, Tf::M1, job.before, |c| {
+        let keep = c.start >= job.from && c.start < job.before && ny_date(c.start) == date;
+        if keep {
+            out.push(c);
         }
-        out.push(c);
-        ts = c.start;
-    }
+        keep
+    });
     out.reverse();
     (out, failed)
 }
@@ -69,7 +57,7 @@ mod tests {
     use super::*;
 
     fn ny(d: u32, h: u32, m: u32) -> i64 {
-        New_York.with_ymd_and_hms(2026, 11, d, h, m, 0).unwrap().timestamp()
+        crate::nytime::test::ny(2026, 11, d, h, m)
     }
 
     #[test]

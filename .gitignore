@@ -2,3 +2,7 @@
 *.exe
 .env
 config.json
+/.claude/worktrees/
+/.claude/skills/
+/docs/plan.md
+/docs/stream-design.md

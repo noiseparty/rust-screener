@@ -88,21 +88,60 @@ const CX: f64 = 96.0;
 const BASE: usize = 62;
 
 struct Pal {
-    lit: Rgb, lit2: Rgb, mid: Rgb, soft: Rgb, sh: Rgb, sh2: Rgb, sh3: Rgb,
-    arch: Rgb, arch2: Rgb, arch3: Rgb, black: Rgb, tree: Rgb, tree2: Rgb, lawn: Rgb, lawn2: Rgb,
-    path: Rgb, path2: Rgb, water: Rgb, water2: Rgb, moon: Rgb, moon2: Rgb, halo: Rgb,
-    cloud: Rgb, cloud2: Rgb, bird: Rgb,
+    lit: Rgb,
+    lit2: Rgb,
+    mid: Rgb,
+    soft: Rgb,
+    sh: Rgb,
+    sh2: Rgb,
+    sh3: Rgb,
+    arch: Rgb,
+    arch2: Rgb,
+    arch3: Rgb,
+    black: Rgb,
+    tree: Rgb,
+    tree2: Rgb,
+    lawn: Rgb,
+    lawn2: Rgb,
+    path: Rgb,
+    path2: Rgb,
+    water: Rgb,
+    water2: Rgb,
+    moon: Rgb,
+    moon2: Rgb,
+    halo: Rgb,
+    cloud: Rgb,
+    cloud2: Rgb,
+    bird: Rgb,
 }
 
 fn pal() -> Pal {
     Pal {
-        lit: hex("#e9eef6"), lit2: hex("#dbe3ef"), mid: hex("#c9d3e4"), soft: hex("#b7c3d8"),
-        sh: hex("#94a2bd"), sh2: hex("#7f8eab"), sh3: hex("#6d7c99"),
-        arch: hex("#1e2740"), arch2: hex("#2b3756"), arch3: hex("#3c4a6b"), black: hex("#03050a"),
-        tree: hex("#03050a"), tree2: hex("#0a0f1c"), lawn: hex("#0a0f1c"), lawn2: hex("#24344e"),
-        path: hex("#6a7898"), path2: hex("#a5b2ca"), water: hex("#2a3e70"), water2: hex("#34497c"),
-        moon: hex("#fffdf2"), moon2: hex("#f4f6fb"), halo: hex("#8ea6c8"),
-        cloud: hex("#4a6098"), cloud2: hex("#5e74a8"), bird: hex("#0a1024"),
+        lit: hex("#e9eef6"),
+        lit2: hex("#dbe3ef"),
+        mid: hex("#c9d3e4"),
+        soft: hex("#b7c3d8"),
+        sh: hex("#94a2bd"),
+        sh2: hex("#7f8eab"),
+        sh3: hex("#6d7c99"),
+        arch: hex("#1e2740"),
+        arch2: hex("#2b3756"),
+        arch3: hex("#3c4a6b"),
+        black: hex("#03050a"),
+        tree: hex("#03050a"),
+        tree2: hex("#0a0f1c"),
+        lawn: hex("#0a0f1c"),
+        lawn2: hex("#24344e"),
+        path: hex("#6a7898"),
+        path2: hex("#a5b2ca"),
+        water: hex("#2a3e70"),
+        water2: hex("#34497c"),
+        moon: hex("#fffdf2"),
+        moon2: hex("#f4f6fb"),
+        halo: hex("#8ea6c8"),
+        cloud: hex("#4a6098"),
+        cloud2: hex("#5e74a8"),
+        bird: hex("#0a1024"),
     }
 }
 
@@ -137,7 +176,15 @@ impl Mausoleum {
                 };
                 let d = ((x as f64 - moon.0).powi(2) + (y as f64 - moon.1).powi(2)).sqrt();
                 col = mix(col, c.halo, clamp01(1.0 - (d - mr) / 30.0).powi(2) * 0.55);
-                let px = if d < mr { if d < mr - 1.5 { c.moon } else { c.moon2 } } else { col };
+                let px = if d < mr {
+                    if d < mr - 1.5 {
+                        c.moon
+                    } else {
+                        c.moon2
+                    }
+                } else {
+                    col
+                };
                 s.put(x as f64, y as f64, px, SKY);
             }
         }
@@ -153,7 +200,11 @@ impl Mausoleum {
         let shade = |x: f64, x0: f64, x1: f64| clamp01((x - x0) / (x1 - x0));
         let marble = |u: f64, n: f64| {
             let v = clamp01(u + n);
-            if v < 0.5 { mix(c.sh3, c.soft, v / 0.5) } else { mix(c.soft, c.lit, (v - 0.5) / 0.5) }
+            if v < 0.5 {
+                mix(c.sh3, c.soft, v / 0.5)
+            } else {
+                mix(c.soft, c.lit, (v - 0.5) / 0.5)
+            }
         };
         for y in 56..BASE {
             for x in 50..=142 {
@@ -166,7 +217,15 @@ impl Mausoleum {
             for x in 66..=126 {
                 let (xf, yf) = (x as f64, y as f64);
                 let corner = x < 75 || x > 117;
-                let u = if corner { if x < 75 { 0.45 } else { 0.9 } } else { 0.55 + 0.3 * shade(xf, 75.0, 117.0) };
+                let u = if corner {
+                    if x < 75 {
+                        0.45
+                    } else {
+                        0.9
+                    }
+                } else {
+                    0.55 + 0.3 * shade(xf, 75.0, 117.0)
+                };
                 s.put(xf, yf, marble(u, (noise2(xf / 3.0, yf / 3.0, 2) - 0.5) * 0.06), BUILD);
             }
         }
@@ -251,9 +310,7 @@ impl Mausoleum {
                 let mut yy = (y - ht).floor();
                 while yy <= y {
                     let v = (y - yy) / ht;
-                    let ww = wd
-                        * (PI * ((1.0 - v) * 0.9 + 0.1).min(1.0)).sin()
-                        * if v > 0.85 { (1.0 - v) / 0.15 } else { 1.0 };
+                    let ww = wd * (PI * ((1.0 - v) * 0.9 + 0.1).min(1.0)).sin() * if v > 0.85 { (1.0 - v) / 0.15 } else { 1.0 };
                     let mut x = (cx - ww).floor();
                     while x <= cx + ww {
                         s.put(x, yy, if x > cx { cyp } else { c.black }, TREE);
@@ -318,7 +375,11 @@ impl Mausoleum {
 
     fn marble(&self, u: f64) -> Rgb {
         let v = clamp01(u);
-        if v < 0.5 { mix(self.c.sh3, self.c.soft, v / 0.5) } else { mix(self.c.soft, self.c.lit, (v - 0.5) / 0.5) }
+        if v < 0.5 {
+            mix(self.c.sh3, self.c.soft, v / 0.5)
+        } else {
+            mix(self.c.soft, self.c.lit, (v - 0.5) / 0.5)
+        }
     }
 
     fn cupola(&mut self, cx: f64, base: f64, r: f64, h: f64) {
@@ -347,7 +408,13 @@ impl Mausoleum {
             let ww = w + (y - top) / (bottom - top) * 0.6;
             let mut x = (cx - ww).floor();
             while x <= cx + ww {
-                let col = if x < cx { self.c.sh } else if x == cx.floor() { self.c.mid } else { self.c.lit2 };
+                let col = if x < cx {
+                    self.c.sh
+                } else if x == cx.floor() {
+                    self.c.mid
+                } else {
+                    self.c.lit2
+                };
                 self.put(x, y, col, BUILD);
                 x += 1.0;
             }
@@ -444,10 +511,7 @@ pub const GEAR_H: usize = 25;
 pub fn gear_frame(t: f64) -> Vec<(char, Rgb)> {
     static PALS: OnceLock<(Vec<Rgb>, Vec<Rgb>)> = OnceLock::new();
     let (gear, steel) = PALS.get_or_init(|| {
-        (
-            gradient(&["#7a3e0c", "#d9822b", "#ffa657", "#ffd8a8"], 8),
-            gradient(&["#484f58", "#8b949e", "#c9d1d9", "#ffffff"], 6),
-        )
+        (gradient(&["#7a3e0c", "#d9822b", "#ffa657", "#ffd8a8"], 8), gradient(&["#484f58", "#8b949e", "#c9d1d9", "#ffffff"], 6))
     });
     // source rows 1..=24 map to our rows 0..=23 (hazard stripes dropped)
     const H: i64 = 26;
@@ -520,7 +584,18 @@ pub fn gear_frame(t: f64) -> Vec<(char, Rgb)> {
         for x in 28..48 {
             let m = mask[(x + y * w) as usize];
             if m != 0 {
-                set(x, y, if m > 4 { '█' } else if m > 2 { '▓' } else { '▒' }, steel[m as usize - 1]);
+                set(
+                    x,
+                    y,
+                    if m > 4 {
+                        '█'
+                    } else if m > 2 {
+                        '▓'
+                    } else {
+                        '▒'
+                    },
+                    steel[m as usize - 1],
+                );
             }
         }
     }

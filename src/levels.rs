@@ -9,12 +9,15 @@
 
 use crate::engine::Candle;
 use crate::history::{self, Tf};
-use chrono::{Datelike, Duration, NaiveTime, TimeZone, Timelike, Weekday};
-use chrono_tz::America::New_York;
+use crate::nytime::{self, REG_CLOSE, REG_OPEN};
+use crate::store;
+use chrono::{Datelike, Duration, Weekday};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// Sub-folder of the data directory holding the cache.
+pub const DIR: &str = "levels";
 /// How far back 4h bars are fetched.
 pub const LOOKBACK_DAYS: i64 = 365;
 const LOOKBACK_SECS: i64 = LOOKBACK_DAYS * 86_400;
@@ -59,15 +62,14 @@ pub struct Level {
 /// one returns the bar before it, which the caller drops as a duplicate).
 pub fn bar_ends(from: i64, to: i64) -> Vec<i64> {
     let mut out = Vec::new();
-    let (Some(a), Some(b)) = (New_York.timestamp_opt(from, 0).single(), New_York.timestamp_opt(to, 0).single()) else {
+    let (Some(a), Some(b)) = (nytime::at(from), nytime::at(to)) else {
         return out;
     };
     let mut d = a.date_naive();
     while d <= b.date_naive() {
         if !matches!(d.weekday(), Weekday::Sat | Weekday::Sun) {
             for (h, m) in BAR_ENDS {
-                let t = d.and_time(NaiveTime::from_hms_opt(h, m, 0).unwrap_or_default());
-                if let Some(ts) = New_York.from_local_datetime(&t).single().map(|t| t.timestamp()) {
+                if let Some(ts) = nytime::ts(d, h, m) {
                     if ts > from && ts <= to {
                         out.push(ts);
                     }
@@ -158,39 +160,21 @@ impl Data {
     }
 }
 
-/// Cache file of `symbol` in `dir` (symbols like "BRK B" are made file-safe).
-fn cache_path(dir: &Path, symbol: &str) -> PathBuf {
-    let safe: String = symbol.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
-    dir.join(format!("{safe}.csv"))
-}
-
 /// Writes `data` as `from,through,oldest` then one `start,open,high,low,close,volume` line per bar.
 pub fn save(dir: &Path, symbol: &str, data: &Data) -> io::Result<()> {
     let Some((from, through)) = data.cover else { return Ok(()) };
-    fs::create_dir_all(dir)?;
     let mut s = format!("{from},{through},{}\n", u8::from(data.oldest));
-    for c in &data.bars {
-        s.push_str(&format!("{},{},{},{},{},{}\n", c.start, c.open, c.high, c.low, c.close, c.volume));
-    }
-    let path = cache_path(dir, symbol);
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, s)?;
-    fs::rename(tmp, path)
+    s.extend(data.bars.iter().map(store::format_line));
+    crate::fsutil::write_atomic(&store::path(dir, symbol), s)
 }
 
 /// The cached bars of `symbol`, with their lines drawn at `now`.
 pub fn load(dir: &Path, symbol: &str, now: i64) -> Option<Data> {
-    let s = fs::read_to_string(cache_path(dir, symbol)).ok()?;
+    let s = fs::read_to_string(store::path(dir, symbol)).ok()?;
     let mut lines = s.lines();
     let head: Vec<i64> = lines.next()?.split(',').filter_map(|v| v.trim().parse().ok()).collect();
     let [from, through, oldest] = head[..] else { return None };
-    let bars: Vec<Candle> = lines
-        .filter_map(|l| {
-            let f: Vec<&str> = l.split(',').collect();
-            let n = |i: usize| f.get(i)?.trim().parse::<f64>().ok();
-            Some(Candle { start: f.first()?.trim().parse().ok()?, open: n(1)?, high: n(2)?, low: n(3)?, close: n(4)?, volume: f.get(5)?.trim().parse().ok()? })
-        })
-        .collect();
+    let bars = store::parse_candles(lines).0;
     let lines = swing_levels(&bars, now);
     Some(Data { bars, cover: Some((from, through)), oldest: oldest == 1, lines })
 }
@@ -229,7 +213,7 @@ pub fn fetch(req: &Req) -> Option<Vec<Candle>> {
             .chunks(chunk)
             .map(|part| {
                 s.spawn(move || {
-                    let agent = crate::scraper::agent();
+                    let agent = crate::net::agent();
                     let mut v = Vec::new();
                     for &ts in part {
                         let a = history::try_bar_at(&agent, id, Tf::H4, ts);
@@ -259,21 +243,15 @@ fn gather(answers: Vec<Result<Option<Candle>, ()>>) -> Option<Vec<Candle>> {
     Some(out)
 }
 
-fn ny_minute(ts: i64) -> Option<(chrono::DateTime<chrono_tz::Tz>, u32)> {
-    let t = New_York.timestamp_opt(ts, 0).single()?;
-    let m = t.hour() * 60 + t.minute();
-    Some((t, m))
-}
-
 /// Start of today's window: the latest 16:00 New York market close at or before `now`
 /// that has a market bar. Its candles never grey out or remove a line.
 fn window_start(bars: &[Candle], now: i64) -> Option<i64> {
     bars.iter().rev().find_map(|c| {
-        let (t, m) = ny_minute(c.start)?;
-        if !(570..960).contains(&m) {
+        let t = nytime::at(c.start)?;
+        if !(REG_OPEN..REG_CLOSE).contains(&nytime::minute_of_day(&t)) {
             return None;
         }
-        let close = New_York.from_local_datetime(&t.date_naive().and_hms_opt(16, 0, 0)?).single()?.timestamp();
+        let close = nytime::ts(t.date_naive(), REG_CLOSE / 60, 0)?;
         (close <= now).then_some(close)
     })
 }
@@ -351,10 +329,13 @@ pub fn swing_levels(bars: &[Candle], now: i64) -> Vec<Level> {
     for (j, &t0) in stl.iter().enumerate().filter(|(_, t)| **t >= tl) {
         let t1 = stl.get(j + 1).copied().unwrap_or(i64::MAX);
         // oldest first with >=, so of equal highs the newest wins
-        let best = sth
-            .iter()
-            .filter(|h| h.1 >= t0 && h.1 <= t1 && h.1 > tl && h.0 <= cap)
-            .fold(None, |b: Option<(f64, i64)>, &h| if b.is_some_and(|b| h.0 < b.0) { b } else { Some(h) });
+        let best = sth.iter().filter(|h| h.1 >= t0 && h.1 <= t1 && h.1 > tl && h.0 <= cap).fold(None, |b: Option<(f64, i64)>, &h| {
+            if b.is_some_and(|b| h.0 < b.0) {
+                b
+            } else {
+                Some(h)
+            }
+        });
         if let Some(b) = best.filter(|b| Some(b.1) != last_t) {
             cands.push(b);
             last_t = Some(b.1);
@@ -380,9 +361,7 @@ pub fn swing_levels(bars: &[Candle], now: i64) -> Vec<Level> {
 mod tests {
     use super::*;
 
-    fn ny(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> i64 {
-        New_York.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap().timestamp()
-    }
+    use crate::nytime::test::ny;
 
     fn bar(start: i64, high: f64, low: f64, close: f64) -> Candle {
         Candle { start, open: close, high, low, close, volume: 1 }
@@ -392,7 +371,8 @@ mod tests {
     fn bar_ends_are_the_weekday_session_ends() {
         // Fri 13 Nov 2026 12:00 to Mon 16 Nov 09:30 (New York)
         let ends = bar_ends(ny(2026, 11, 13, 12, 0), ny(2026, 11, 16, 9, 30));
-        let want = [ny(2026, 11, 13, 13, 30), ny(2026, 11, 13, 16, 0), ny(2026, 11, 13, 20, 0), ny(2026, 11, 16, 8, 0), ny(2026, 11, 16, 9, 30)];
+        let want =
+            [ny(2026, 11, 13, 13, 30), ny(2026, 11, 13, 16, 0), ny(2026, 11, 13, 20, 0), ny(2026, 11, 16, 8, 0), ny(2026, 11, 16, 9, 30)];
         assert_eq!(ends, want);
     }
 
@@ -424,12 +404,11 @@ mod tests {
 
     #[test]
     fn cache_round_trip_and_prune() {
-        let dir = std::env::temp_dir().join(format!("vs-levels-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = crate::fsutil::test::scratch("test-levels", "cache");
         let mut d = Data { cover: Some((10, 20)), oldest: true, ..Data::default() };
         d.bars = vec![bar(14_400, 2.5, 1.25, 2.0)];
         save(&dir, "BRK B", &d).unwrap();
-        assert!(dir.join("BRK_B.csv").exists());
+        assert!(store::path(&dir, "BRK B").exists());
         let back = load(&dir, "BRK B", 0).unwrap();
         assert_eq!((back.bars, back.cover, back.oldest), (d.bars, d.cover, true));
         assert!(load(&dir, "NONE", 0).is_none());
@@ -470,7 +449,10 @@ mod tests {
     #[test]
     fn lines_near_the_price_are_kept() {
         // the long-term high at 20 with the last close just below it (no distance window)
-        let hs = [10.0, 12.0, 11.0, 14.0, 12.0, 13.0, 11.0, 20.0, 12.0, 15.0, 12.0, 13.0, 11.0, 17.0, 12.0, 14.0, 12.0, 15.5, 11.0, 13.5, 10.0, 18.0, 9.0];
+        let hs = [
+            10.0, 12.0, 11.0, 14.0, 12.0, 13.0, 11.0, 20.0, 12.0, 15.0, 12.0, 13.0, 11.0, 17.0, 12.0, 14.0, 12.0, 15.5, 11.0, 13.5, 10.0,
+            18.0, 9.0,
+        ];
         let mut bars: Vec<Candle> = hs.iter().enumerate().map(|(i, &h)| bar(i as i64 * 14_400, h, h - 1.0, h - 0.5)).collect();
         bars.push(bar(23 * 14_400, 19.8, 19.0, 19.5));
         let lv = swing_levels(&bars, i64::MAX);
@@ -480,7 +462,10 @@ mod tests {
     #[test]
     fn picks_lth_and_the_highest_high_per_swing_low_segment() {
         // highs build a long-term high at 20, then a pullback with two segments
-        let hs = [10.0, 12.0, 11.0, 14.0, 12.0, 13.0, 11.0, 20.0, 12.0, 15.0, 12.0, 13.0, 11.0, 17.0, 12.0, 14.0, 12.0, 15.5, 11.0, 13.5, 10.0, 18.0, 9.0];
+        let hs = [
+            10.0, 12.0, 11.0, 14.0, 12.0, 13.0, 11.0, 20.0, 12.0, 15.0, 12.0, 13.0, 11.0, 17.0, 12.0, 14.0, 12.0, 15.5, 11.0, 13.5, 10.0,
+            18.0, 9.0,
+        ];
         let bars: Vec<Candle> = hs.iter().enumerate().map(|(i, &h)| bar(i as i64 * 14_400, h, h - 1.0, h - 0.5)).collect();
         let lv = swing_levels(&bars, i64::MAX);
         assert!(lv.iter().any(|l| l.price == 20.0), "{lv:?}");

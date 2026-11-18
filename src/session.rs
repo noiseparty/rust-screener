@@ -1,5 +1,5 @@
+use crate::nytime::{self, AFTER_CLOSE, PRE_OPEN, REG_CLOSE, REG_OPEN};
 use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
-use chrono_tz::America::New_York;
 
 /// US equity session, derived from New York time so DST is always correct.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,13 +16,11 @@ impl Session {
     }
 
     pub fn at<Tz: TimeZone>(t: DateTime<Tz>) -> Session {
-        let ny = t.with_timezone(&New_York);
-        let m = ny.hour() * 60 + ny.minute();
-        match m {
-            m if m < 4 * 60 => Session::Closed,
-            m if m < 9 * 60 + 30 => Session::Pre,
-            m if m < 16 * 60 => Session::Reg,
-            m if m < 20 * 60 => Session::After,
+        match nytime::minute_of_day(&nytime::of(&t)) {
+            m if m < PRE_OPEN => Session::Closed,
+            m if m < REG_OPEN => Session::Pre,
+            m if m < REG_CLOSE => Session::Reg,
+            m if m < AFTER_CLOSE => Session::After,
             _ => Session::Closed,
         }
     }
@@ -33,17 +31,17 @@ impl Session {
     /// (17:30-18:30), regular to 16:00 (23:00), after-market to 20:00 (03:00). Outside them it
     /// counts to the next weekday's pre-market (US holidays are not known).
     pub fn phase<Tz: TimeZone>(t: DateTime<Tz>) -> (&'static str, &'static str, i64) {
-        let ny = t.with_timezone(&New_York);
+        let ny = nytime::of(&t);
         let weekday = ny.weekday().number_from_monday() <= 5;
-        let m = ny.hour() * 60 + ny.minute();
+        let m = nytime::minute_of_day(&ny);
         let phases: [(u32, &str, &str); 5] = [
-            (9 * 60 + 30, "Pre Market", "open in"),
+            (REG_OPEN, "Pre Market", "open in"),
             (10 * 60 + 30, "Regular Market", "zombie hour in"),
             (11 * 60 + 30, "Regular - Zombie Hour", "ends in"),
-            (16 * 60, "Regular Market", "close in"),
-            (20 * 60, "After Market", "closes in"),
+            (REG_CLOSE, "Regular Market", "close in"),
+            (AFTER_CLOSE, "After Market", "closes in"),
         ];
-        if weekday && m >= 4 * 60 {
+        if weekday && m >= PRE_OPEN {
             if let Some(&(end, label, until)) = phases.iter().find(|(end, _, _)| m < *end) {
                 let secs = i64::from(end * 60) - i64::from(m * 60 + ny.second());
                 return (label, until, secs);
@@ -51,16 +49,13 @@ impl Session {
         }
         // next weekday 04:00
         let mut day = ny.date_naive();
-        if m >= 4 * 60 || !weekday {
+        if m >= PRE_OPEN || !weekday {
             day = day.succ_opt().unwrap_or(day);
         }
         while day.weekday().number_from_monday() > 5 {
             day = day.succ_opt().unwrap_or(day);
         }
-        let open = New_York
-            .from_local_datetime(&day.and_hms_opt(4, 0, 0).unwrap_or_default())
-            .earliest()
-            .map_or(0, |o| (o.with_timezone(&Utc) - t.with_timezone(&Utc)).num_seconds());
+        let open = nytime::ts(day, PRE_OPEN / 60, 0).map_or(0, |o| o - t.with_timezone(&Utc).timestamp());
         ("Market Closed", "pre-market in", open.max(0))
     }
 
@@ -86,6 +81,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono_tz::America::New_York;
 
     fn ny(h: u32, m: u32) -> DateTime<chrono_tz::Tz> {
         New_York.with_ymd_and_hms(2026, 1, 12, h, m, 0).unwrap()

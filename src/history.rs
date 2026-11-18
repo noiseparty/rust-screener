@@ -6,6 +6,7 @@
 //! newest first, labelled with the START of the New York day.
 
 use crate::engine::Candle;
+use crate::nytime::{self, AFTER_CLOSE, PRE_OPEN, REG_CLOSE, REG_OPEN};
 use serde_json::Value;
 
 const API: &str = "https://quotes-gw.webullfintech.com/api/quote/charts/query?extendTrading=1";
@@ -84,13 +85,12 @@ pub struct Req {
 /// (New York 04:00, 09:30, 16:00) and counted from each session's start, so a 4h bar can be
 /// 08:00-09:30 or 13:30-16:00 and a 1h bar 09:00-09:30.
 fn bar_start(label: i64, secs: i64) -> i64 {
-    use chrono::{TimeZone, Timelike};
-    use chrono_tz::America::New_York;
-    let Some(t) = New_York.timestamp_opt(label, 0).single() else { return label - secs };
-    let m = i64::from(t.hour() * 60 + t.minute());
-    let sess = [16 * 60, 9 * 60 + 30, 4 * 60].into_iter().find(|&s| s < m);
+    use chrono::Timelike;
+    let Some(t) = nytime::at(label) else { return label - secs };
+    let m = i64::from(nytime::minute_of_day(&t));
+    let sess = [REG_CLOSE, REG_OPEN, PRE_OPEN].into_iter().map(i64::from).find(|&s| s < m);
     match sess {
-        Some(s) if m <= 20 * 60 => {
+        Some(s) if m <= i64::from(AFTER_CLOSE) => {
             let from = label - (m - s) * 60 - i64::from(t.second());
             from + (label - 1 - from) / secs * secs
         }
@@ -102,15 +102,14 @@ fn bar_start(label: i64, secs: i64) -> i64 {
 /// session cuts (New York 09:30, 16:00, 20:00, as `bar_start`) and a daily bar at the next
 /// New York midnight.
 pub fn bar_end(start: i64, tf: Tf) -> i64 {
-    use chrono::{Days, TimeZone, Timelike};
-    use chrono_tz::America::New_York;
-    let Some(t) = New_York.timestamp_opt(start, 0).single() else { return start + tf.secs() };
+    use chrono::{Days, Timelike};
+    let Some(t) = nytime::at(start) else { return start + tf.secs() };
     if tf == Tf::D1 {
-        let next = t.date_naive().checked_add_days(Days::new(1)).and_then(|d| d.and_hms_opt(0, 0, 0));
-        return next.and_then(|d| New_York.from_local_datetime(&d).earliest()).map_or(start + tf.secs(), |d| d.timestamp());
+        let next = t.date_naive().checked_add_days(Days::new(1));
+        return next.and_then(|d| nytime::ts(d, 0, 0)).unwrap_or(start + tf.secs());
     }
-    let m = i64::from(t.hour() * 60 + t.minute());
-    let cut = [9 * 60 + 30, 16 * 60, 20 * 60].into_iter().find(|&c| c > m);
+    let m = i64::from(nytime::minute_of_day(&t));
+    let cut = [REG_OPEN, REG_CLOSE, AFTER_CLOSE].into_iter().map(i64::from).find(|&c| c > m);
     let full = start + tf.secs();
     cut.map_or(full, |c| full.min(start + (c - m) * 60 - i64::from(t.second())))
 }
@@ -132,7 +131,7 @@ fn parse_bar(s: &str, tf: Tf) -> Option<Candle> {
 
 fn query(agent: &ureq::Agent, ticker_id: u64, tf: Tf, extra: &str) -> Option<Vec<Candle>> {
     let url = format!("{API}&type={}&tickerIds={ticker_id}{extra}", tf.api());
-    let body: Value = crate::limiter::get(agent, &url).ok()?.into_json().ok()?;
+    let body = crate::net::get_json(agent, &url).ok()?;
     // a valid answer without bar data (e.g. before a listing) means no bars, not a failed request
     // (an error object instead of the usual array still counts as a failure)
     body.as_array()?;
@@ -144,6 +143,19 @@ fn query(agent: &ureq::Agent, ticker_id: u64, tf: Tf, extra: &str) -> Option<Vec
 /// HTTP error, the shared limiter's 403 pause), `Ok(None)` when Webull has no such bar.
 pub fn try_bar_at(agent: &ureq::Agent, ticker_id: u64, tf: Tf, ts: i64) -> Result<Option<Candle>, ()> {
     query(agent, ticker_id, tf, &format!("&count=1&timestamp={ts}")).map(|v| v.into_iter().next()).ok_or(())
+}
+
+/// Walks back one bar at a time from the bar ending at or before `ts`, newest first, handing
+/// each bar to `keep` until it returns false or Webull has no older bar. True when a request
+/// failed.
+pub fn walk_back(agent: &ureq::Agent, ticker_id: u64, tf: Tf, mut ts: i64, mut keep: impl FnMut(Candle) -> bool) -> bool {
+    loop {
+        match try_bar_at(agent, ticker_id, tf, ts) {
+            Ok(Some(c)) if keep(c) => ts = c.start,
+            Ok(_) => return false,
+            Err(()) => return true,
+        }
+    }
 }
 
 /// Intraday bars come one request each; the chart is handed over every this many bars.
@@ -167,35 +179,26 @@ pub fn fetch(agent: &ureq::Agent, req: &Req, now: i64, mut progress: impl FnMut(
     }
     // Walk back bar by bar (newest first).
     let mut out: Vec<Candle> = Vec::new();
-    let mut failed = false;
-    let mut ts = match req.mode {
+    let from = match req.mode {
         Mode::Full | Mode::Since(_) => now + req.tf.secs(),
         // the bar ending at `s` is the one before the bar starting at `s`
         Mode::Before(s) => s,
     };
     // a top-up walks back until it reaches the held bar, so a cache from days ago is not cut off
     let limit = if matches!(req.mode, Mode::Since(_)) { MAX_HELD } else { BARS };
-    while out.len() < limit {
-        let c = match try_bar_at(agent, req.ticker_id, req.tf, ts) {
-            Ok(Some(c)) => c,
-            Ok(None) => break,
-            Err(()) => {
-                failed = true;
-                break;
-            }
-        };
+    let failed = walk_back(agent, req.ticker_id, req.tf, from, |c| {
         if out.last().is_some_and(|l| c.start >= l.start) {
-            break;
+            return false;
         }
         out.push(c);
-        ts = c.start;
         if matches!(req.mode, Mode::Since(s) if c.start <= s) {
-            break;
+            return false;
         }
         if out.len() % PROGRESS_EVERY == 0 && out.len() < BARS && !matches!(req.mode, Mode::Since(_)) {
             progress(out.iter().rev().copied().collect());
         }
-    }
+        out.len() < limit
+    });
     out.reverse();
     (out, failed)
 }

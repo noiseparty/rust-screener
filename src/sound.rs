@@ -57,9 +57,7 @@ pub fn play_alert(volume: u8, muted: bool) {
     let buf = slot.insert(wav);
     // SAFETY: with SND_MEMORY the pointer is a complete WAV image; it lives in PLAYING until the
     // next call stops this sound (above) before dropping it.
-    unsafe {
-        PlaySoundW(buf.as_ptr().cast(), std::ptr::null_mut(), SND_MEMORY | SND_ASYNC | SND_NODEFAULT)
-    };
+    unsafe { PlaySoundW(buf.as_ptr().cast(), std::ptr::null_mut(), SND_MEMORY | SND_ASYNC | SND_NODEFAULT) };
 }
 
 #[cfg(not(windows))]

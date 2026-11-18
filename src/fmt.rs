@@ -122,8 +122,24 @@ pub const ROWS: [(&str, &str); 9] = [
 /// Rows that take typing.
 pub const TYPED_ROWS: usize = 2;
 
+/// `HH:MM:SS`; negative counts as zero.
+pub fn hms(secs: i64) -> String {
+    let s = secs.max(0);
+    format!("{:02}:{:02}:{:02}", s / 3600, s % 3600 / 60, s % 60)
+}
+
+/// A running time: `42s`, `5m 07s`, `3h 12m`.
+pub fn uptime(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    match s {
+        0..60 => format!("{s}s"),
+        60..3600 => format!("{}m {:02}s", s / 60, s % 60),
+        _ => format!("{}h {:02}m", s / 3600, s % 3600 / 60),
+    }
+}
+
 /// Next (or previous) of `opts` after `cur`; an unknown value goes to the first.
-fn cycle<T: PartialEq + Clone>(opts: &[T], cur: &T, back: bool) -> T {
+pub fn cycle<T: PartialEq + Clone>(opts: &[T], cur: &T, back: bool) -> T {
     let n = opts.len();
     let i = match opts.iter().position(|o| o == cur) {
         Some(i) if back => (i + n - 1) % n,
@@ -198,7 +214,11 @@ enum Zone {
 }
 
 fn zone(name: &str) -> Option<Zone> {
-    if name == "Local" { Some(Zone::Local) } else { name.parse::<Tz>().ok().map(Zone::Tz) }
+    if name == "Local" {
+        Some(Zone::Local)
+    } else {
+        name.parse::<Tz>().ok().map(Zone::Tz)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -329,7 +349,11 @@ impl Active {
 
     fn money(&self, v: f64) -> String {
         let (n, c) = (self.price(v), &self.f.currency);
-        if self.f.currency_after { format!("{n}{c}") } else { format!("{c}{n}") }
+        if self.f.currency_after {
+            format!("{n}{c}")
+        } else {
+            format!("{c}{n}")
+        }
     }
 
     fn count(&self, v: f64) -> String {
@@ -475,7 +499,10 @@ mod tests {
     #[test]
     fn counts_abbreviated_or_full() {
         set(&Formats::default());
-        assert_eq!((count(950.0), count(18_400_000.0), count(123_456_789.0), count(2.5e9)), ("950".into(), "18.40M".into(), "123.5M".into(), "2.50B".into()));
+        assert_eq!(
+            (count(950.0), count(18_400_000.0), count(123_456_789.0), count(2.5e9)),
+            ("950".into(), "18.40M".into(), "123.5M".into(), "2.50B".into())
+        );
         set(&Formats { volume_full: true, thousands: ",".into(), ..Formats::default() });
         assert_eq!(count(18_400_000.4), "18,400,000");
         set(&Formats { decimal: ',', ..Formats::default() });
@@ -516,7 +543,15 @@ mod tests {
         assert!(Formats { timezone: "Nowhere".into(), ..Formats::default() }.problem().is_some());
         assert!(Formats { date: "MM".into(), ..Formats::default() }.problem().is_some());
         assert!(Formats { thousands: ".".into(), ..Formats::default() }.problem().is_some());
-        let mut f = Formats { timezone: "x".into(), date: "y".into(), decimal: ';', thousands: "_".into(), currency: "¥".into(), price_decimals: 3, ..Formats::default() };
+        let mut f = Formats {
+            timezone: "x".into(),
+            date: "y".into(),
+            decimal: ';',
+            thousands: "_".into(),
+            currency: "¥".into(),
+            price_decimals: 3,
+            ..Formats::default()
+        };
         f.validate();
         assert_eq!(f, Formats::default());
         // an old config without the key gets the defaults

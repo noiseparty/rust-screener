@@ -9,8 +9,7 @@ use std::path::Path;
 pub const FILTER_NAMES: [&str; 3] = ["ALL", "NEW", "SETUP"];
 
 /// Old config keys and the SETUP keys that replaced them (value copied as is).
-const SETUP_KEY_MIGRATION: [(&str, &str); 2] =
-    [("spike_vol_ratio", "setup_vol_ratio"), ("baseline_window_sec", "setup_window_sec")];
+const SETUP_KEY_MIGRATION: [(&str, &str); 2] = [("spike_vol_ratio", "setup_vol_ratio"), ("baseline_window_sec", "setup_window_sec")];
 
 /// Dashboard layout, picked with the header tabs or `w`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -235,12 +234,13 @@ impl Config {
     }
 
     pub fn save(&self, path: &Path) -> io::Result<()> {
-        let data = serde_json::to_string_pretty(self)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        fs::write(path, data)
+        let data = serde_json::to_string_pretty(self).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        crate::fsutil::write_atomic(path, data)
     }
 
+    /// Clamps out-of-range values; unusable ones fall back to the defaults.
     pub fn validate(&mut self) {
+        let d = Config::default();
         if self.refresh_interval_seconds < 1 {
             self.refresh_interval_seconds = 1;
         }
@@ -248,27 +248,27 @@ impl Config {
             self.alert_history_max = 10;
         }
         if self.rank_tracking_interval_seconds == 0 {
-            self.rank_tracking_interval_seconds = 60;
+            self.rank_tracking_interval_seconds = d.rank_tracking_interval_seconds;
         } else if self.rank_tracking_interval_seconds < 5 {
             self.rank_tracking_interval_seconds = 5;
         }
         if self.recompute_ms != 500 {
-            self.recompute_ms = 1000;
+            self.recompute_ms = d.recompute_ms;
         }
         if !(self.setup_vol_ratio > 0.0 && self.setup_vol_ratio.is_finite()) {
-            self.setup_vol_ratio = 2.2;
+            self.setup_vol_ratio = d.setup_vol_ratio;
         }
         if !(self.setup_price_pct > 0.0 && self.setup_price_pct.is_finite()) {
-            self.setup_price_pct = 10.0;
+            self.setup_price_pct = d.setup_price_pct;
         }
         if self.setup_window_sec == 0 {
-            self.setup_window_sec = 300;
+            self.setup_window_sec = d.setup_window_sec;
         }
         if self.alert_cooldown_sec == 0 {
-            self.alert_cooldown_sec = 120;
+            self.alert_cooldown_sec = d.alert_cooldown_sec;
         }
         if self.vol_m_window_seconds == 0 {
-            self.vol_m_window_seconds = 180;
+            self.vol_m_window_seconds = d.vol_m_window_seconds;
         } else if self.vol_m_window_seconds < 30 {
             self.vol_m_window_seconds = 30;
         }

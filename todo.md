@@ -1,6 +1,6 @@
 # TODO
 
-Status as of 2026-11-17: all build steps done. Spec: `docs/plan.md` (user decisions, authoritative) and `docs/stream-design.md`. Handoff: `CONTINUE.md`.
+Status as of 2026-11-18: all build steps and MarketGUI v1.0.0 done; the app is in daily use. Code reorganised on 2026-11-18 (see `CLAUDE.md`). Spec: `docs/plan.md` (user decisions, authoritative) and `docs/stream-design.md`.
 
 ## Done (committed)
 
@@ -22,14 +22,14 @@ Status as of 2026-11-17: all build steps done. Spec: `docs/plan.md` (user decisi
 - [x] 16. Rate panel tabs (`1590e93`)
 - [x] 17. Settings consolidation (`e33d1bc`)
 - [x] 18. Candle storage (`270b9f5`)
-- [x] 19. Final review + release (`a6ac657`): plan check, README and CONTINUE.md updated, `cargo build --release` (0 warnings), 165 tests pass, exe copied to the project root. Clippy is not installed, so no clippy pass.
+- [x] 19. Final review + release (`a6ac657`): plan check, README and handoff notes updated, `cargo build --release` (0 warnings), 165 tests pass, exe copied to the project root. Clippy is not installed, so no clippy pass.
 
 ## User actions
 
-- [ ] Run `volume_screener.exe --probe` one day from before 11:00 to after 23:00 Riga time, then share the CSV so stream behaviour at session changes can be checked (extended-hours price, volume/high/low resets, status codes, subscription cap).
+- [ ] Run `MarketGUI-cli.exe --probe` one day from before 11:00 to after 23:00 Riga time, then share the CSV so stream behaviour at session changes can be checked (extended-hours price, volume/high/low resets, status codes, subscription cap).
 - [ ] After the probe data: check `MAX_SUBS = 100` against the probe (200 subscriptions were accepted), the step-9 older-session drop rule, and the regular-hours price field (`close`).
-- [ ] Run the TUI once and look at it: nothing in the final build has been seen on screen (header indicator, Vol/m, Mov, dimming, rate tabs, Settings, candle files in `%LOCALAPPDATA%\VolumeScreener\data\`).
-- [ ] Decide whether the public repo keeps the Webull stream details in `docs/`, or becomes private. Nothing is pushed yet.
+- [x] Run the app and look at it (2026-11-18: in daily use, works as intended).
+- [x] Webull stream details: `docs/plan.md` and `docs/stream-design.md` untracked and gitignored (2026-11-18); they stay local. Already-pushed history still has them.
 
 ## Open questions / later
 

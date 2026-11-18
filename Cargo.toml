@@ -42,6 +42,15 @@ lto = true
 codegen-units = 1
 strip = true
 
+# Trace build (README "Debugging / trace mode"): optimised like release but without LTO, so it
+# builds much faster; debug assertions turn tracing on. `cargo build --profile debugrel`.
+[profile.debugrel]
+inherits = "release"
+debug-assertions = true
+lto = false
+codegen-units = 16
+strip = false
+
 [build-dependencies]
 embed-resource = "3"
 

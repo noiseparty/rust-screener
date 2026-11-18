@@ -222,7 +222,11 @@ fn title_bar(ui: &mut egui::Ui, bar: Rect, bg: Color32, fg: Color32, font: &Font
 
     let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
     let btn_w = (bar.height() * 2.0).round();
-    let buttons = [("─", egui::ViewportCommand::Minimized(true)), (if maximized { "❐" } else { "□" }, egui::ViewportCommand::Maximized(!maximized)), ("✕", egui::ViewportCommand::Close)];
+    let buttons = [
+        ("─", egui::ViewportCommand::Minimized(true)),
+        (if maximized { "❐" } else { "□" }, egui::ViewportCommand::Maximized(!maximized)),
+        ("✕", egui::ViewportCommand::Close),
+    ];
     let mut right = bar.max.x;
     let mut drag_area = bar;
     for (i, (glyph, cmd)) in buttons.into_iter().enumerate().rev() {
@@ -438,6 +442,8 @@ fn key_event(key: egui::Key, m: egui::Modifiers) -> Option<KeyEvent> {
         K::End => KeyCode::End,
         K::PageUp => KeyCode::PageUp,
         K::PageDown => KeyCode::PageDown,
+        // trace mode's debug overlay
+        K::F12 => KeyCode::F(12),
         k if m.ctrl => {
             let name = k.name();
             let mut chars = name.chars();
@@ -482,9 +488,22 @@ fn color(c: Color, default: Color32) -> Color32 {
 /// xterm 256-colour palette.
 fn indexed(i: u8) -> Color32 {
     const BASIC: [Color; 16] = [
-        Color::Black, Color::Red, Color::Green, Color::Yellow, Color::Blue, Color::Magenta, Color::Cyan, Color::Gray,
-        Color::DarkGray, Color::LightRed, Color::LightGreen, Color::LightYellow, Color::LightBlue, Color::LightMagenta,
-        Color::LightCyan, Color::White,
+        Color::Black,
+        Color::Red,
+        Color::Green,
+        Color::Yellow,
+        Color::Blue,
+        Color::Magenta,
+        Color::Cyan,
+        Color::Gray,
+        Color::DarkGray,
+        Color::LightRed,
+        Color::LightGreen,
+        Color::LightYellow,
+        Color::LightBlue,
+        Color::LightMagenta,
+        Color::LightCyan,
+        Color::White,
     ];
     match i {
         0..=15 => color(BASIC[i as usize], DEFAULT_FG),

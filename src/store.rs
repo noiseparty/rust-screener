@@ -9,8 +9,7 @@
 //! first column); `migrate_day_files` moves those into the per-ticker files once.
 
 use crate::engine::Candle;
-use chrono::{DateTime, NaiveDate, Utc};
-use chrono_tz::America::New_York;
+use chrono::NaiveDate;
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -18,11 +17,6 @@ use std::path::{Path, PathBuf};
 
 /// Sub-folder of the data directory holding the per-ticker files.
 pub const DIR: &str = "candles";
-
-/// New York trading date of an epoch-seconds instant.
-pub fn ny_date(epoch_secs: i64) -> NaiveDate {
-    DateTime::<Utc>::from_timestamp(epoch_secs, 0).unwrap_or_default().with_timezone(&New_York).date_naive()
-}
 
 /// File of `symbol`. Letters, digits, `.` and `-` are kept; anything else (e.g. the space in
 /// "BRK B") becomes `_` followed by its code, so different symbols never share a file.
@@ -45,7 +39,14 @@ pub(crate) fn format_line(c: &Candle) -> String {
 
 fn parse_fields(f: &[&str]) -> Option<Candle> {
     let num = |s: &str| s.parse::<f64>().ok().filter(|v| v.is_finite());
-    Some(Candle { start: f[0].parse().ok()?, open: num(f[1])?, high: num(f[2])?, low: num(f[3])?, close: num(f[4])?, volume: f[5].parse().ok()? })
+    Some(Candle {
+        start: f[0].parse().ok()?,
+        open: num(f[1])?,
+        high: num(f[2])?,
+        low: num(f[3])?,
+        close: num(f[4])?,
+        volume: f[5].parse().ok()?,
+    })
 }
 
 /// A line written by `format_line`; None when malformed.
@@ -66,17 +67,11 @@ fn complete_lines(bytes: &[u8]) -> Vec<String> {
     }
 }
 
-/// The last `max` candles of `symbol`, oldest first. Malformed lines are skipped; of rows
-/// with the same start the last written wins; a missing file gives an empty list. A file with
-/// rows out of order or repeated (backfilled minutes appended later) is rewritten sorted.
-pub fn load(dir: &Path, symbol: &str, max: usize) -> io::Result<Vec<Candle>> {
-    let p = path(dir, symbol);
-    let bytes = match fs::read(&p) {
-        Ok(b) => b,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
-    };
-    let mut v: Vec<Candle> = complete_lines(&bytes).iter().filter_map(|l| parse_line(l)).collect();
+/// Parses candle lines (`format_line`), skipping malformed ones, sorted by start; of rows
+/// with the same start the last one wins. The flag is true when the lines were out of order or
+/// repeated.
+pub(crate) fn parse_candles<'a>(lines: impl IntoIterator<Item = &'a str>) -> (Vec<Candle>, bool) {
+    let mut v: Vec<Candle> = lines.into_iter().filter_map(parse_line).collect();
     let messy = v.windows(2).any(|w| w[1].start <= w[0].start);
     // the stable sort keeps the write order of equal starts; the later row replaces the kept one
     v.sort_by_key(|c| c.start);
@@ -87,10 +82,22 @@ pub fn load(dir: &Path, symbol: &str, max: usize) -> io::Result<Vec<Candle>> {
         }
         same
     });
+    (v, messy)
+}
+
+/// The last `max` candles of `symbol`, oldest first. Malformed lines are skipped; of rows
+/// with the same start the last written wins; a missing file gives an empty list. A file with
+/// rows out of order or repeated (backfilled minutes appended later) is rewritten sorted.
+pub fn load(dir: &Path, symbol: &str, max: usize) -> io::Result<Vec<Candle>> {
+    let p = path(dir, symbol);
+    let bytes = match fs::read(&p) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let (mut v, messy) = parse_candles(complete_lines(&bytes).iter().map(String::as_str));
     if messy {
-        let text: String = v.iter().map(format_line).collect();
-        let tmp = p.with_extension("tmp");
-        let _ = fs::write(&tmp, text).and_then(|()| fs::rename(&tmp, &p));
+        let _ = crate::fsutil::write_atomic(&p, v.iter().map(format_line).collect::<String>());
     }
     let extra = v.len().saturating_sub(max);
     Ok(v.split_off(extra))
@@ -103,7 +110,10 @@ pub fn migrate_day_files(data: &Path, candles: &Path) -> io::Result<usize> {
     let mut n = 0;
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        let is_day = name.strip_prefix("candles-").and_then(|s| s.strip_suffix(".csv")).is_some_and(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").is_ok());
+        let is_day = name
+            .strip_prefix("candles-")
+            .and_then(|s| s.strip_suffix(".csv"))
+            .is_some_and(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").is_ok());
         if !is_day || !e.file_type().is_ok_and(|t| t.is_file()) {
             continue;
         }
@@ -175,10 +185,7 @@ mod tests {
     use super::*;
 
     fn dir(name: &str) -> PathBuf {
-        let d = PathBuf::from("target").join("test-store").join(name);
-        let _ = fs::remove_dir_all(&d);
-        fs::create_dir_all(&d).unwrap();
-        d
+        crate::fsutil::test::scratch("test-store", name)
     }
 
     fn candle(start: i64, p: f64, vol: i64) -> Candle {

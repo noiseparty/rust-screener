@@ -272,14 +272,18 @@ pub fn run(dir: Option<PathBuf>) -> Result<(), String> {
 
     let (list_tx, list_rx) = mpsc::channel::<Result<Fetched, String>>();
     thread::spawn(move || {
-        let agent = scraper::agent();
+        let agent = crate::net::agent();
         while list_tx.send(scraper::fetch_top_gainers(&agent, PAGE_SIZE)).is_ok() {
             thread::sleep(Duration::from_secs(LIST_REFRESH));
         }
     });
 
     let started = Utc::now();
-    let _ = rec.write(&event_row(started, "start", &format!("probe v{} page_size={PAGE_SIZE} list_refresh_s={LIST_REFRESH}", env!("CARGO_PKG_VERSION"))));
+    let _ = rec.write(&event_row(
+        started,
+        "start",
+        &format!("probe v{} page_size={PAGE_SIZE} list_refresh_s={LIST_REFRESH}", env!("CARGO_PKG_VERSION")),
+    ));
     say(&format!("probe recording to {} (Ctrl+C to stop)", path.display()));
 
     let mut symbols: HashMap<u64, (String, usize)> = HashMap::new();

@@ -54,7 +54,11 @@ pub fn delete(e: &Entry) -> io::Result<()> {
     if PROTECTED.contains(&e.name.as_str()) {
         return Err(io::Error::other(format!("{} is the app's settings and is kept", e.name)));
     }
-    if e.dir { fs::remove_dir_all(&e.path) } else { fs::remove_file(&e.path) }
+    if e.dir {
+        fs::remove_dir_all(&e.path)
+    } else {
+        fs::remove_file(&e.path)
+    }
 }
 
 /// `1.4 MB`, `820 KB`, `12 B`.
@@ -81,7 +85,8 @@ pub struct Browser {
 
 impl Browser {
     pub fn new(root: &Path) -> Browser {
-        let mut b = Browser { root: root.to_path_buf(), cwd: root.to_path_buf(), entries: Vec::new(), cursor: 0, confirm: false, msg: None };
+        let mut b =
+            Browser { root: root.to_path_buf(), cwd: root.to_path_buf(), entries: Vec::new(), cursor: 0, confirm: false, msg: None };
         b.refresh();
         b
     }
@@ -160,7 +165,7 @@ mod tests {
     use super::*;
 
     fn tree(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("vs-storage-{name}-{}", std::process::id()));
+        let d = PathBuf::from("target").join("test-storage").join(name);
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(d.join("data/levels")).unwrap();
         fs::write(d.join("config.json"), "{}").unwrap();

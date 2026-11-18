@@ -4,7 +4,7 @@
 
 use crate::engine::Candle;
 use crate::history::{self, Tf};
-use crate::store::{self, format_line, parse_line};
+use crate::store::{self, format_line};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -19,22 +19,13 @@ fn path(dir: &Path, tf: Tf, symbol: &str) -> PathBuf {
 /// The cached bars of `symbol` in `tf`, oldest first; empty when there are none.
 pub fn load(dir: &Path, tf: Tf, symbol: &str) -> Vec<Candle> {
     let Ok(text) = fs::read_to_string(path(dir, tf, symbol)) else { return Vec::new() };
-    let mut v: Vec<Candle> = text.lines().filter_map(parse_line).collect();
-    v.sort_by_key(|c| c.start);
-    v.dedup_by_key(|c| c.start);
-    v
+    store::parse_candles(text.lines()).0
 }
 
 /// Writes the newest `history::MAX_HELD` of `bars` (oldest first) as the whole file.
 pub fn save(dir: &Path, tf: Tf, symbol: &str, bars: &[Candle]) -> io::Result<()> {
-    let p = path(dir, tf, symbol);
-    if let Some(parent) = p.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let text: String = bars[bars.len().saturating_sub(history::MAX_HELD)..].iter().map(format_line).collect();
-    let tmp = p.with_extension("tmp");
-    fs::write(&tmp, text)?;
-    fs::rename(tmp, p)
+    crate::fsutil::write_atomic(&path(dir, tf, symbol), text)
 }
 
 #[cfg(test)]
@@ -46,9 +37,7 @@ mod tests {
     }
 
     fn dir(name: &str) -> PathBuf {
-        let d = PathBuf::from("target").join("test-barcache").join(name);
-        let _ = fs::remove_dir_all(&d);
-        d
+        crate::fsutil::test::scratch("test-barcache", name)
     }
 
     #[test]

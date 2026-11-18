@@ -1,5 +1,5 @@
 //! App home directory: `%LOCALAPPDATA%\MarketGUI\` holding `config.json`,
-//! `data\` and `probe\`. Base directories are passed in so the logic is testable.
+//! `data\`, `probe\` and `logs\` (trace mode). Base directories are passed in so the logic is testable.
 
 use std::fs;
 use std::io;
@@ -16,6 +16,8 @@ pub struct Paths {
     pub config: PathBuf,
     pub data: PathBuf,
     pub probe: PathBuf,
+    /// Trace logs (`trace`).
+    pub logs: PathBuf,
 }
 
 impl Paths {
@@ -26,12 +28,7 @@ impl Paths {
 
     /// Layout with `home` as the app home.
     pub fn at(home: PathBuf) -> Paths {
-        Paths {
-            config: home.join(CONFIG_FILE),
-            data: home.join("data"),
-            probe: home.join("probe"),
-            home,
-        }
+        Paths { config: home.join(CONFIG_FILE), data: home.join("data"), probe: home.join("probe"), logs: home.join("logs"), home }
     }
 
     /// Layout under `%LOCALAPPDATA%`.
@@ -42,10 +39,11 @@ impl Paths {
         Ok(Paths::under(Path::new(&base)))
     }
 
-    /// Create the home, `data\` and `probe\` directories if missing.
+    /// Create the home, `data\`, `probe\` and `logs\` directories if missing.
     pub fn ensure_dirs(&self) -> io::Result<()> {
         fs::create_dir_all(&self.data)?;
-        fs::create_dir_all(&self.probe)
+        fs::create_dir_all(&self.probe)?;
+        fs::create_dir_all(&self.logs)
     }
 
     /// The old app home (`VolumeScreener`) next to `home`.
@@ -120,6 +118,7 @@ mod tests {
         assert_eq!(p.config, p.home.join("config.json"));
         assert_eq!(p.data, p.home.join("data"));
         assert_eq!(p.probe, p.home.join("probe"));
+        assert_eq!(p.logs, p.home.join("logs"));
     }
 
     #[test]
@@ -156,7 +155,7 @@ mod tests {
         let p = Paths::under(&root.join("local"));
         assert!(!p.home.exists());
         assert!(!p.init(&root.join("cwd")).unwrap());
-        assert!(p.data.is_dir() && p.probe.is_dir());
+        assert!(p.data.is_dir() && p.probe.is_dir() && p.logs.is_dir());
         assert!(!p.config.exists());
     }
 

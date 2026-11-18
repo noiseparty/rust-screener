@@ -5,6 +5,7 @@
 //! Requests get evenly spaced slots at `RATE` per second. A 403 pauses every request for
 //! `PAUSE`, after which the rate is halved.
 
+use crate::trace::{tlog, tnote};
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -85,12 +86,15 @@ fn blocked() {
 pub fn get(agent: &ureq::Agent, url: &str) -> Result<ureq::Response, String> {
     if !take() {
         let m = paused().map_or(0, |d| d.as_secs().div_ceil(60));
+        tnote!("limiter.skip", "paused, {m} min left: {url}");
         return Err(format!("Webull paused after HTTP 403 (rate limit), {m} min left"));
     }
+    tnote!("limiter.get", "{} req/min: {url}", per_minute());
     match agent.get(url).call() {
         Ok(r) => Ok(r),
         Err(ureq::Error::Status(403, _)) => {
             blocked();
+            tlog!("limiter", "HTTP 403: every request paused 15 min, then {:.1} req/s ({url})", with(|s, _| s.rate));
             Err("HTTP 403 from Webull (rate limit): all requests paused 15 min".into())
         }
         Err(e) => Err(e.to_string()),

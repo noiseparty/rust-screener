@@ -106,7 +106,7 @@ mod tests {
 
     #[test]
     fn save_list_load_delete_round_trip() {
-        let d = std::env::temp_dir().join(format!("vs-presets-{}", std::process::id()));
+        let d = std::path::PathBuf::from("target").join("test-presets");
         let _ = fs::remove_dir_all(&d);
         assert_eq!(list(&d), vec![BUILTIN.to_string()]);
         let base = Config::default();

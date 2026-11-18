@@ -2,14 +2,13 @@
 //! "candlestick-chart" piece (MIT, see THIRD_PARTY_LICENSES.md), drawn from real 1-minute candles.
 
 use crate::engine::Candle;
+use crate::fmt;
 use crate::history::{self, Tf};
 use crate::levels::Level;
 use crate::theme::{mix, pal};
-use crate::fmt;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
-
 
 fn put(buf: &mut Buffer, area: Rect, x: i32, y: i32, ch: &str, fg: Color) {
     if x < 0 || y < 0 || x >= area.width as i32 || y >= area.height as i32 {
@@ -52,7 +51,7 @@ pub fn countdown(left: i64, tf: Tf) -> String {
     let (m, s) = (left / 60 % 60, left % 60);
     match tf {
         Tf::M1 | Tf::M5 => format!("{:02}:{s:02}", left / 60),
-        Tf::H1 | Tf::H4 => format!("{:02}:{m:02}:{s:02}", left / 3600),
+        Tf::H1 | Tf::H4 => crate::fmt::hms(left),
         Tf::D1 => format!("{}d {:02}:{m:02}", left / 86_400, left / 3600 % 24),
     }
 }
@@ -197,7 +196,12 @@ pub fn draw(buf: &mut Buffer, area: Rect, symbol: &str, candles: &[Candle], day_
     let up = live.close >= live.open;
     let hx = symbol.len() as i32 + 6;
     let mut x = hx;
-    for (label, v, col) in [("O", live.open, pal().chart_muted), ("H", live.high, pal().chart_muted), ("L", live.low, pal().chart_muted), ("C", live.close, if up { pal().up } else { pal().down })] {
+    for (label, v, col) in [
+        ("O", live.open, pal().chart_muted),
+        ("H", live.high, pal().chart_muted),
+        ("L", live.low, pal().chart_muted),
+        ("C", live.close, if up { pal().up } else { pal().down }),
+    ] {
         let s = format!("{label} {}", fmt::num(v, decimals));
         text(buf, area, x, 0, &s, col);
         x += s.len() as i32 + 2;
@@ -310,7 +314,14 @@ pub fn draw(buf: &mut Buffer, area: Rect, symbol: &str, candles: &[Candle], day_
 
     // time axis
     for (i, c) in view.iter().enumerate().step_by((20 / step as usize).max(1)) {
-        text(buf, area, left + i as i32 * step, rows - 1, &if spec.day_axis { fmt::day(c.start) } else { fmt::time(c.start) }, pal().chart_muted);
+        text(
+            buf,
+            area,
+            left + i as i32 * step,
+            rows - 1,
+            &if spec.day_axis { fmt::day(c.start) } else { fmt::time(c.start) },
+            pal().chart_muted,
+        );
     }
     spec.pixel.then(|| Plot {
         x: area.x + left as u16,
@@ -373,7 +384,15 @@ mod tests {
         let mut candles: Vec<Candle> = (0..20).map(|i| candle(i, 1.0, 10.0)).collect();
         candles[19].close = 5.5;
         let level = |price, taken| Level { price, at: 0, taken };
-        let levels = [level(2.0, false), level(3.0, false), level(4.0, false), level(5.0, false), level(6.0, false), level(7.0, true), level(9.0, true)];
+        let levels = [
+            level(2.0, false),
+            level(3.0, false),
+            level(4.0, false),
+            level(5.0, false),
+            level(6.0, false),
+            level(7.0, true),
+            level(9.0, true),
+        ];
         let mut buf = Buffer::empty(area);
         draw(&mut buf, area, "A", &candles, 0.0, &spec(0, &levels, false));
         // the right end of each line, past the last candle
