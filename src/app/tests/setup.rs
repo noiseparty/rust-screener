@@ -359,3 +359,59 @@ fn presets_carry_their_formats_into_configuration() {
     assert!(app.preset_formats.is_none());
     std::fs::remove_dir_all(&home).unwrap();
 }
+
+#[test]
+fn layouts_pane_builds_a_custom_tab_enter_saves_esc_drops() {
+    use crate::layouts::{Panel, Template};
+    let (mut app, _rx) = test_app(Config::default());
+    let item = SETUP_VIEWS.iter().position(|&v| v == View::SetupLayouts).unwrap();
+    assert_eq!(SETUP_ITEMS[item].0, "Layouts");
+    app.select_setup(item);
+    app.view = View::SetupLayouts;
+    let key = |app: &mut App, c| app.on_key(KeyEvent::new(c, KeyModifiers::NONE));
+    // Show: on; Name: typed (j and k are letters here)
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Right);
+    key(&mut app, KeyCode::Down);
+    for c in "Mk j".chars() {
+        key(&mut app, KeyCode::Char(c));
+    }
+    key(&mut app, KeyCode::Backspace);
+    key(&mut app, KeyCode::Backspace);
+    // Template: two columns -> 2 rows -> left | right split
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Right);
+    key(&mut app, KeyCode::Right);
+    assert_eq!(app.layout_draft().template, Template::LeftRight2);
+    assert_eq!(app.layout_draft().slots, vec![Panel::Chart, Panel::List, Panel::Empty]);
+    // Slot A: Chart -> Bubbles; Slot C: Empty -> Alerts (List is in Slot B, which keeps it)
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Right);
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Right);
+    assert_eq!(app.layout_draft().slots, vec![Panel::Bubbles, Panel::List, Panel::Alerts]);
+    // nothing saved before Enter
+    assert!(app.cfg.custom_layouts.is_empty());
+    key(&mut app, KeyCode::Enter);
+    assert!(app.view == View::SetupMenu);
+    let saved = &app.cfg.custom_layouts[0];
+    assert_eq!((saved.on, saved.name.as_str(), saved.template), (true, "Mk", Template::LeftRight2));
+    assert_eq!(app.cfg.tabs().last(), Some(&Layout::Custom1));
+    assert_eq!(app.cfg.layout_label(Layout::Custom1), "Mk");
+    // Esc drops a change
+    app.select_setup(item);
+    app.view = View::SetupLayouts;
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Right);
+    assert!(!app.layout_draft().on);
+    key(&mut app, KeyCode::Esc);
+    assert!(app.view == View::SetupMenu && app.cfg.custom_layouts[0].on && app.layout_draft().on);
+    // switched off while shown: the dashboard goes back to Full
+    app.cfg.layout = Layout::Custom1;
+    app.view = View::SetupLayouts;
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Right);
+    key(&mut app, KeyCode::Enter);
+    assert_eq!((app.cfg.layout, app.cfg.tabs().len()), (Layout::Full, 5));
+}

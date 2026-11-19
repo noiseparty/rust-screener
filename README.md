@@ -101,7 +101,13 @@ footer   key hints
 tape     scrolling top-30 gainers
 ```
 
-- **Layouts** (header tabs or `w`): Full (alerts + list + chart), List, Chart, Alerts (full-height, scrollable).
+- **Layouts** (header tabs or `w`): Full (alerts + list + chart), List, Chart, Bubbles, Alerts (full-height, scrollable).
+- **Bubbles**: the listed tickers (up to 40) as bubbles whose area follows their volume over the selected timeframe
+  (the last 1m / 5m / 1h / 4h of their 1m candles, the day's volume on D), labelled with ticker and that volume.
+  `1`-`5` / `t` or the title tabs switch the timeframe. In Full and List they fill the rows the list does not need.
+- **Volume chart** (under the bubbles): the listed tickers' total volume per minute as a braille line scrolling left,
+  shaded below, with the minute in progress tagged on the right and the shown max / average in the title. It keeps
+  its 10 rows when there is no room for the bubbles.
 - **Market phase** in New York time with a countdown: Pre Market 04:00-09:30, Regular 09:30-16:00 (with the
   10:30-11:30 "zombie hour" marked), After Market 16:00-20:00, otherwise Market Closed (US holidays are not known).
 - **Connection status**: green `● online n Hz` = stream receiving n messages/s; amber `● REST` = polling fallback;
@@ -144,7 +150,8 @@ The selected row is charted beside the list; `Enter` opens it full screen (↑/�
 - **Navigate** like TradingView: drag the plot, drag the price axis to scale (double-click to fit), mouse wheel to zoom
   time, `0` to reset. Dragging back past the oldest bar fetches older ones.
 - **4h swing levels** (all timeframes except D): the 3 untaken levels nearest the price are drawn, levels already
-  traded through are dimmed, levels off-screen become edge tags, each labelled with date and price.
+  traded through are dimmed, levels off-screen become edge tags, each labelled with date and price. Levels that fall
+  on the same text row are drawn as one, tagged with the newest plus ` +N` for the others.
 - **Price tag and countdown** on the price axis, showing time left in the current candle.
 
 ### Configuration
@@ -172,6 +179,12 @@ back (and drops unsaved changes).
 - **Presets**: named configurations (`presets\<name>.json`); the built-in *Recommended* is always first.
 - **Theme**: 40 themes with a live mini-dashboard preview: the default *Dark Noir* plus the
   [opaline](https://github.com/hyperb1iss/opaline) set (Catppuccin, Tokyo Night, Gruvbox, Nord, Dracula, …).
+- **Layouts**: up to 3 dashboard tabs of your own, shown after the built-in ones (header and `w`). Each picks an
+  arrangement (one panel, 2 or 3 columns / rows, a side split, a 2 x 2 grid), a panel per slot (List, Alerts, Chart,
+  Bubbles, Volume, Blacklist; each once) and the split sizes. Enter saves, Esc drops the changes.
+  `e` (here, or on the dashboard while a custom tab is shown) opens the **on-screen editor**: the tab full size with
+  live data, template buttons and widget chips on top. Drag a widget onto a slot (between slots they swap; dragged
+  out, or right-clicked, a slot empties), drag the borders to resize (10-90 %). Enter saves, Esc cancels.
 - **Time & Format**: time zone (any IANA name), date pattern, 12/24 h clock, currency symbol, decimal and thousands
   separators, price decimals, abbreviated or full volumes. Market phases and candle boundaries always stay New York based.
 - **Blacklist**: hide tickers from the ranking (still tracked, listed separately).
@@ -189,8 +202,9 @@ Saving re-filters and re-sorts locally without a new fetch. Older config keys ar
 | `↑/↓` `j/k`, PgUp/PgDn, `g` | move the row cursor (it follows the selected symbol) |
 | `←/→` `h/l`, `s` | select a column, sort by it (again to flip) |
 | `Enter` | full-screen chart of the selected row |
-| `1`-`5`, `t`, `0` | chart timeframe, next timeframe, reset the chart view |
+| `1`-`5`, `t`, `0` | timeframe (chart and bubbles), next timeframe, reset the chart view |
 | `w` | next layout |
+| `e` | edit the shown custom tab on screen |
 | `f` | cycle the alert filter (ALL / NEW / SETUP) |
 | `v` | column visibility |
 | `o` / `c` | Config |

@@ -1,3 +1,4 @@
+use crate::layouts::{self, CustomLayout, Panel};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -24,27 +25,22 @@ pub enum Layout {
     Chart,
     /// The alerts only, full height and scrollable.
     Alerts,
+    /// The listed tickers as bubbles sized by their volume over the timeframe.
+    Bubbles,
+    /// The user's own tabs (`Config::custom_layouts`, Config -> Layouts).
+    Custom1,
+    Custom2,
+    Custom3,
 }
 
 impl Layout {
-    pub const ALL: [Layout; 4] = [Layout::Full, Layout::List, Layout::Chart, Layout::Alerts];
+    /// The built-in tabs.
+    pub const ALL: [Layout; 5] = [Layout::Full, Layout::List, Layout::Chart, Layout::Bubbles, Layout::Alerts];
+    pub const CUSTOM: [Layout; layouts::MAX] = [Layout::Custom1, Layout::Custom2, Layout::Custom3];
 
-    pub fn label(self) -> &'static str {
-        match self {
-            Layout::Full => "Full",
-            Layout::List => "List",
-            Layout::Chart => "Chart",
-            Layout::Alerts => "Alerts",
-        }
-    }
-
-    pub fn next(self) -> Layout {
-        Layout::ALL[(Layout::ALL.iter().position(|&l| l == self).unwrap_or(0) + 1) % Layout::ALL.len()]
-    }
-
-    /// Whether this layout can show the chart.
-    pub fn has_chart(self) -> bool {
-        matches!(self, Layout::Full | Layout::Chart)
+    /// Which custom tab this is (0-based).
+    pub fn custom_index(self) -> Option<usize> {
+        Layout::CUSTOM.iter().position(|&l| l == self)
     }
 }
 
@@ -101,6 +97,8 @@ pub struct Config {
     /// Text size of the app window (GUI), in points. Ctrl+mouse wheel changes it.
     pub font_size: f32,
     pub layout: Layout,
+    /// The user's own tabs (`Layout::Custom1..3`), at most `layouts::MAX`.
+    pub custom_layouts: Vec<CustomLayout>,
     /// The scrolling ticker tape and the key hints at the bottom of the dashboard.
     pub ticker_tape: bool,
     pub key_hints: bool,
@@ -150,6 +148,7 @@ impl Default for Config {
             theme: "dark-noir".to_string(),
             font_size: 15.0,
             layout: Layout::Full,
+            custom_layouts: Vec::new(),
             ticker_tape: true,
             key_hints: true,
             alert_rows: ALERT_ROWS_MIN,
@@ -282,6 +281,59 @@ impl Config {
         for f in FILTER_NAMES {
             self.filter_enabled.entry(f.to_string()).or_insert(true);
         }
+        self.custom_layouts.truncate(layouts::MAX);
+        self.custom_layouts.iter_mut().for_each(CustomLayout::normalize);
+        if self.layout.custom_index().is_some() && self.custom(self.layout).is_none() {
+            self.layout = Layout::Full;
+        }
+    }
+
+    /// The custom tab `l`, when it is set up and switched on.
+    pub fn custom(&self, l: Layout) -> Option<&CustomLayout> {
+        self.custom_layouts.get(l.custom_index()?).filter(|c| c.is_used())
+    }
+
+    /// The header tabs: the built-in ones, then the custom ones in use.
+    pub fn tabs(&self) -> Vec<Layout> {
+        Layout::ALL.into_iter().chain(Layout::CUSTOM.into_iter().filter(|&l| self.custom(l).is_some())).collect()
+    }
+
+    /// The tab after the current one.
+    pub fn next_layout(&self) -> Layout {
+        let tabs = self.tabs();
+        tabs[(tabs.iter().position(|&l| l == self.layout).map_or(0, |i| i + 1)) % tabs.len()]
+    }
+
+    /// A tab's name: the built-in name, or the custom one's (else "Custom N").
+    pub fn layout_label(&self, l: Layout) -> String {
+        match l {
+            Layout::Full => "Full".into(),
+            Layout::List => "List".into(),
+            Layout::Chart => "Chart".into(),
+            Layout::Alerts => "Alerts".into(),
+            Layout::Bubbles => "Bubbles".into(),
+            _ => {
+                let i = l.custom_index().unwrap_or(0);
+                self.custom(l).map(|c| c.name.clone()).filter(|n| !n.is_empty()).unwrap_or_else(|| format!("Custom {}", i + 1))
+            }
+        }
+    }
+
+    /// Whether the current tab shows `p` (built-in tabs: as they are drawn).
+    pub fn shows(&self, p: Panel) -> bool {
+        match self.layout {
+            Layout::Full => matches!(p, Panel::List | Panel::Alerts | Panel::Chart | Panel::Bubbles | Panel::Volume | Panel::Blacklist),
+            Layout::List => matches!(p, Panel::List | Panel::Alerts | Panel::Bubbles | Panel::Volume),
+            Layout::Chart => matches!(p, Panel::Chart | Panel::Blacklist),
+            Layout::Bubbles => matches!(p, Panel::Bubbles | Panel::Volume),
+            Layout::Alerts => p == Panel::Alerts,
+            l => self.custom(l).is_some_and(|c| c.contains(p)),
+        }
+    }
+
+    /// Whether the current tab uses the timeframe (the chart, the bubbles).
+    pub fn uses_timeframe(&self) -> bool {
+        self.shows(Panel::Chart) || self.shows(Panel::Bubbles)
     }
 
     pub fn filter_on(&self, name: &str) -> bool {
@@ -456,8 +508,33 @@ mod tests {
         let mut c = Config::from_json(r#"{"layout":"alerts","ticker_tape":false,"alert_rows":40}"#).unwrap();
         c.validate();
         assert_eq!((c.layout, c.ticker_tape, c.key_hints, c.alert_rows), (Layout::Alerts, false, true, 15));
-        assert_eq!(Layout::Alerts.next(), Layout::Full);
-        assert_eq!(Layout::Full.next(), Layout::List);
+        assert_eq!(c.next_layout(), Layout::Full);
+        c.layout = Layout::Full;
+        assert_eq!(c.next_layout(), Layout::List);
+    }
+
+    #[test]
+    fn custom_tabs_follow_the_built_in_ones_and_fall_back_when_gone() {
+        let on = |name: &str| CustomLayout { on: true, name: name.into(), ..CustomLayout::default() };
+        let mut c = Config { custom_layouts: vec![on("Mine"), CustomLayout::default(), on("")], ..Config::default() };
+        c.validate();
+        assert_eq!(&c.tabs()[5..], [Layout::Custom1, Layout::Custom3]);
+        assert_eq!((c.layout_label(Layout::Custom1), c.layout_label(Layout::Custom3)), ("Mine".into(), "Custom 3".into()));
+        c.layout = Layout::Alerts;
+        assert_eq!(c.next_layout(), Layout::Custom1);
+        c.layout = Layout::Custom3;
+        assert_eq!(c.next_layout(), Layout::Full);
+        // the default custom tab: chart | list
+        c.layout = Layout::Custom1;
+        assert!(c.shows(Panel::Chart) && c.uses_timeframe() && !c.shows(Panel::Alerts));
+        // a saved tab that is no longer set up: Full
+        let mut c = Config::from_json(r#"{"layout":"custom2"}"#).unwrap();
+        c.validate();
+        assert_eq!(c.layout, Layout::Full);
+        // round trip
+        let c = Config { custom_layouts: vec![on("Mine")], layout: Layout::Custom1, ..Config::default() };
+        let back = Config::from_json(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!((back.layout, back.custom_layouts), (Layout::Custom1, c.custom_layouts));
     }
 
     #[test]

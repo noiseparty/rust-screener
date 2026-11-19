@@ -51,6 +51,7 @@ pub(super) fn setup_shell(f: &mut Frame, app: &mut App) {
         View::SetupBlacklist => Some(BLACKLIST_W),
         View::SetupFilters => Some(FILTERS_W),
         View::SetupFormat => Some(FORMAT_W),
+        View::SetupLayouts => Some(super::custom::LAYOUTS_W),
         _ => None,
     };
     let (pane, preview) = match pane_w {
@@ -68,6 +69,7 @@ pub(super) fn setup_shell(f: &mut Frame, app: &mut App) {
         View::SetupFilters => setup_filters(f, app, pane),
         View::SetupSound => setup_sound(f, app, pane),
         View::SetupFormat => setup_format(f, app, pane, active),
+        View::SetupLayouts => super::custom::setup_layouts(f, app, pane, active),
         View::Storage => storage_view(f, app, pane),
         _ => health(f, app, pane),
     }
@@ -78,6 +80,7 @@ pub(super) fn setup_shell(f: &mut Frame, app: &mut App) {
         (View::SetupBlacklist, Some(p)) => blacklisted_preview(f, app, p),
         (View::SetupFilters, Some(p)) => alerts_preview(f, app, p),
         (View::SetupFormat, Some(p)) => format_preview(f, p),
+        (View::SetupLayouts, Some(p)) => super::custom::layouts_preview(f, app, p),
         _ => {}
     }
     let esc = ("esc", "back", Some(KeyCode::Esc));
@@ -119,6 +122,14 @@ pub(super) fn setup_shell(f: &mut Frame, app: &mut App) {
         View::SetupFormat => vec![
             ("↑↓", "move", None),
             ("←→", "choose", None),
+            ("enter", "save", Some(KeyCode::Enter)),
+            ("esc", "cancel", Some(KeyCode::Esc)),
+        ],
+        View::SetupLayouts => vec![
+            ("e", "edit on screen", Some(KeyCode::Char('e'))),
+            ("↑↓", "move", None),
+            ("←→", "choose", None),
+            ("type", "name", None),
             ("enter", "save", Some(KeyCode::Enter)),
             ("esc", "cancel", Some(KeyCode::Esc)),
         ],

@@ -2,6 +2,7 @@
 //! chart and the Columns overlay.
 
 use super::tables::{alerts_table, gainers_table, gainers_width};
+use super::volume::VOL_H;
 use super::{centered, hint_bar, keyhint, kind_style, panel, title};
 use crate::app::{App, COLUMNS};
 use crate::config::Layout as Dash;
@@ -45,6 +46,12 @@ pub(super) fn dashboard(f: &mut Frame, app: &mut App) {
         Dash::List => alerts_and_list(f, app, main),
         Dash::Chart => chart_column(f, app, main),
         Dash::Alerts => alerts_table(f, app, main),
+        Dash::Bubbles => super::bubbles::bubbles_and_volume(f, app, main),
+        l => {
+            if let Some(c) = app.cfg.custom(l).cloned() {
+                super::custom::custom(f, app, main, &c);
+            }
+        }
     }
     if app.cfg.key_hints {
         footer_bar(f, app, footer);
@@ -55,15 +62,25 @@ pub(super) fn dashboard(f: &mut Frame, app: &mut App) {
 }
 
 /// Alerts panel (`alert_rows` rows plus header and borders) over the gainers list; the panel
-/// is shown only while the list keeps at least 5 rows.
+/// is shown only while the list keeps at least 5 rows. The rows the list does not need go to
+/// the volume chart, and to the bubbles over it when there are enough.
 fn alerts_and_list(f: &mut Frame, app: &mut App, area: Rect) {
     let rows = app.cfg.alert_rows;
     let alerts_h = if area.height >= rows + 3 + 8 { rows + 3 } else { 0 };
-    let [alerts, gainers] = Layout::vertical([Constraint::Length(alerts_h), Constraint::Min(0)]).areas(area);
+    let [alerts, rest] = Layout::vertical([Constraint::Length(alerts_h), Constraint::Min(0)]).areas(area);
     if alerts_h > 0 {
         alerts_table(f, app, alerts);
     }
+    // the list's rows, header and borders; the rest to the volume chart, then the bubbles
+    let list_h = app.tickers.len() as u16 + 3;
+    let spare = rest.height.saturating_sub(list_h);
+    if spare < VOL_H {
+        gainers_table(f, app, rest);
+        return;
+    }
+    let [gainers, below] = Layout::vertical([Constraint::Min(0), Constraint::Length(spare)]).areas(rest);
     gainers_table(f, app, gainers);
+    super::bubbles::bubbles_and_volume(f, app, below);
 }
 
 /// The chart of the charted row, with the blacklisted tickers under it.
@@ -95,22 +112,27 @@ pub(super) fn chart_view(f: &mut Frame, app: &mut App) {
     );
 }
 
-/// Bordered chart of `sym` in the current timeframe, with clickable timeframe tabs in the
-/// title. 1m comes from the candles collected today (plus backfill); the others from Webull.
-fn chart_panel(f: &mut Frame, app: &mut App, area: Rect, sym: &str) {
-    let tf = app.timeframe;
-    let mut ttl = vec![Span::styled(" CHART ", Style::new().fg(pal().accent).bold()), Span::raw(" ")];
-    let mut x = area.x + 1 + 8;
+/// Panel title `name` followed by the timeframe tabs (clickable) of the panel at `area`.
+pub(super) fn tf_title(app: &mut App, area: Rect, name: &'static str) -> Line<'static> {
+    let mut ttl = vec![Span::styled(name, Style::new().fg(pal().accent).bold()), Span::raw(" ")];
+    let mut x = area.x + 1 + name.len() as u16 + 1;
     for t in Tf::ALL {
         let label = format!(" {} ", t.label());
         let w = label.len() as u16;
-        let st = if t == tf { Style::new().fg(pal().on_accent).bg(pal().accent).bold() } else { Style::new().fg(pal().dim) };
+        let st = if t == app.timeframe { Style::new().fg(pal().on_accent).bg(pal().accent).bold() } else { Style::new().fg(pal().dim) };
         app.hits.tf_tabs.push((Rect::new(x, area.y, w, 1).intersection(area), t));
         ttl.push(Span::styled(label, st));
         ttl.push(Span::raw(" "));
         x += w + 1;
     }
-    let block = panel(Line::from(ttl));
+    Line::from(ttl)
+}
+
+/// Bordered chart of `sym` in the current timeframe, with clickable timeframe tabs in the
+/// title. 1m comes from the candles collected today (plus backfill); the others from Webull.
+pub(super) fn chart_panel(f: &mut Frame, app: &mut App, area: Rect, sym: &str) {
+    let tf = app.timeframe;
+    let block = panel(tf_title(app, area, " CHART "));
     let inner = block.inner(area).inner(ratatui::layout::Margin::new(1, 0));
     f.render_widget(block, area);
     if sym.is_empty() {
@@ -187,12 +209,13 @@ fn header_bar(f: &mut Frame, app: &mut App, area: Rect) {
         clock.clone(),
     ]);
     let short = Line::from(vec![Span::raw(" "), clock]);
-    let tabs: Vec<Span> = Dash::ALL
+    let layouts = app.cfg.tabs();
+    let tabs: Vec<Span> = layouts
         .iter()
         .map(|&l| {
             let st =
                 if l == app.cfg.layout { Style::new().fg(pal().on_accent).bg(pal().accent).bold() } else { Style::new().fg(pal().dim) };
-            Span::styled(format!(" {} ", l.label()), st)
+            Span::styled(format!(" {} ", app.cfg.layout_label(l)), st)
         })
         .collect();
     // one space before the strip and after each tab
@@ -202,7 +225,7 @@ fn header_bar(f: &mut Frame, app: &mut App, area: Rect) {
     let show_tabs = area.width >= tabs_w + short.width() as u16 + dot_w;
     if show_tabs {
         let mut x = area.x + 1;
-        for (s, &l) in tabs.iter().zip(&Dash::ALL) {
+        for (s, &l) in tabs.iter().zip(&layouts) {
             let w = s.width() as u16;
             app.hits.layout_tabs.push((Rect::new(x, area.y, w, 1), l));
             x += w + 1;
@@ -294,7 +317,7 @@ fn ticker_tape(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn blacklist_box(f: &mut Frame, app: &App, area: Rect) {
+pub(super) fn blacklist_box(f: &mut Frame, app: &App, area: Rect) {
     let lines: Vec<Line> = app
         .blacklisted
         .iter()

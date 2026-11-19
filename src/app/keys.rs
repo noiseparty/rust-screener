@@ -28,6 +28,8 @@ impl App {
             View::SetupTheme => self.key_theme(k),
             View::SetupSound => self.key_sound(k),
             View::SetupFormat => self.key_format(k),
+            View::SetupLayouts => self.key_layouts(k),
+            View::LayoutEdit => self.key_layout_edit(k),
         }
     }
 
@@ -142,9 +144,10 @@ impl App {
 
     pub(super) fn key_dashboard(&mut self, k: KeyEvent) {
         let ncols = self.visible_cols.len();
-        let chart = self.cfg.layout.has_chart();
-        // the Alerts layout has no list: up/down scroll the alerts
-        if self.cfg.layout == Layout::Alerts {
+        let chart = self.cfg.shows(Panel::Chart);
+        let tf = self.cfg.uses_timeframe();
+        // a tab with the alerts but no list: up/down scroll the alerts
+        if self.cfg.shows(Panel::Alerts) && !self.cfg.shows(Panel::List) {
             let s = self.alert_scroll;
             let scrolled = match k.code {
                 KeyCode::Up | KeyCode::Char('k') => Some(s.saturating_sub(1)),
@@ -162,7 +165,7 @@ impl App {
         match k.code {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('r') => self.request_fetch(),
-            KeyCode::Char('w') => self.set_layout(self.cfg.layout.next()),
+            KeyCode::Char('w') => self.set_layout(self.cfg.next_layout()),
             KeyCode::Left | KeyCode::Char('h') => self.sel_col = self.sel_col.saturating_sub(1),
             KeyCode::Right | KeyCode::Char('l') => self.sel_col = (self.sel_col + 1).min(ncols.saturating_sub(1)),
             KeyCode::Up | KeyCode::Char('k') => self.move_row(self.row.saturating_sub(1)),
@@ -197,14 +200,15 @@ impl App {
                     }
                 }
             }
-            // chart keys only where the layout shows the chart
-            KeyCode::Char(c @ '1'..='5') if chart => self.set_timeframe(Tf::ALL[c as usize - '1' as usize]),
-            KeyCode::Char('t') if chart => self.set_timeframe(self.timeframe.next()),
+            // timeframe keys where the layout uses it, the others only where it shows the chart
+            KeyCode::Char(c @ '1'..='5') if tf => self.set_timeframe(Tf::ALL[c as usize - '1' as usize]),
+            KeyCode::Char('t') if tf => self.set_timeframe(self.timeframe.next()),
             KeyCode::Char('0') if chart => {
                 self.reset_chart_view();
                 self.scale = crate::chart::DEFAULT_SCALE;
             }
             KeyCode::Char('o') | KeyCode::Char('c') => self.open_setup(),
+            KeyCode::Char('e') => self.edit_current_tab(),
             KeyCode::Char('v') => {
                 self.view = View::Columns;
                 self.col_cursor = 0;

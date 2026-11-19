@@ -360,3 +360,152 @@ fn trace_mode_shows_in_the_header_and_footer_and_the_overlay_hides_the_chart() {
         assert!(app.plot.is_none() && app.hits.keys.is_empty());
     }
 }
+
+#[test]
+fn bubbles_layout_labels_the_tickers_and_follows_the_timeframe_keys() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let (htx, _hrx) = std::sync::mpsc::channel();
+    let cfg = Config { layout: Dash::Bubbles, ticker_tape: false, ..Config::default() };
+    let mut app = App::new(cfg, "target/test-config/unused-bubbles-config.json".into(), tx, htx, None);
+    app.view = View::Dashboard;
+    let mk = |s: &str, volume| Ticker { symbol: s.into(), price: 2.0, volume, ..Default::default() };
+    app.tickers = vec![mk("BIG", 9_000_000), mk("MID", 2_000_000), mk("NONE", 0)];
+    let key = |app: &mut App, c| app.on_key(crossterm::event::KeyEvent::new(c, crossterm::event::KeyModifiers::NONE));
+    // D: the day's volume
+    key(&mut app, KeyCode::Char('5'));
+    assert_eq!(app.timeframe, crate::history::Tf::D1);
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| draw(f, &mut app)).unwrap();
+    let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+    let rows: Vec<String> = text.chars().collect::<Vec<_>>().chunks(120).map(|r| r.iter().collect()).collect();
+    assert!(text.contains("BIG") && text.contains("MID") && !text.contains("NONE"), "{rows:#?}");
+    assert!(text.contains(&fmt::count(9_000_000.0)));
+    // the window app paints them itself: biggest first, the cells stay blank
+    app.pixel_chart = true;
+    term.draw(|f| draw(f, &mut app)).unwrap();
+    assert_eq!(app.bubbles.iter().map(|b| b.lines[0].as_str()).collect::<Vec<_>>(), ["BIG", "MID"]);
+    assert!(app.bubbles[0].r > app.bubbles[1].r);
+    let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+    assert!(!text.contains("MID"));
+    // 1m: no candles, no volume
+    key(&mut app, KeyCode::Char('1'));
+    term.draw(|f| draw(f, &mut app)).unwrap();
+    assert!(app.bubbles.is_empty());
+}
+
+#[test]
+fn bubbles_fill_the_rows_the_list_leaves_in_full_and_list() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let (htx, _hrx) = std::sync::mpsc::channel();
+    let mut app = App::new(Config { ticker_tape: false, ..Config::default() }, "target/test-config/unused-bubbles2.json".into(), tx, htx, None);
+    app.view = View::Dashboard;
+    app.pixel_chart = true;
+    app.timeframe = crate::history::Tf::D1;
+    let mk = |i: i64| Ticker { symbol: format!("S{i}"), price: 2.5, volume: i * 1_000_000, ..Default::default() };
+    for layout in [Dash::Full, Dash::List] {
+        app.cfg.layout = layout;
+        app.tickers = (1..=4).map(mk).collect();
+        let mut term = Terminal::new(TestBackend::new(160, 45)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(!app.bubbles.is_empty(), "{layout:?}");
+        assert_eq!(app.bubbles[0].lines[2], fmt::price(2.5));
+        // a list that needs the rows: no bubbles
+        app.tickers = (1..=40).map(mk).collect();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(app.bubbles.is_empty(), "{layout:?}");
+    }
+}
+
+#[test]
+fn custom_tabs_draw_their_panels_and_keep_hits_apart() {
+    use crate::config::Layout;
+    use crate::layouts::{CustomLayout, Panel, Template};
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let (htx, _hrx) = std::sync::mpsc::channel();
+    let grid = CustomLayout {
+        on: true,
+        name: "Mine".into(),
+        template: Template::Grid,
+        slots: vec![Panel::Chart, Panel::Bubbles, Panel::List, Panel::Alerts],
+        splits: vec![50, 50],
+    };
+    let cfg = Config { custom_layouts: vec![grid], layout: Layout::Custom1, ..Config::default() };
+    let mut app = App::new(cfg, "target/test-config/unused-custom-config.json".into(), tx, htx, None);
+    app.view = View::Dashboard;
+    let mk = |i: i64| Ticker { symbol: format!("S{i}"), price: 2.0, volume: i * 1_000_000, ..Default::default() };
+    app.tickers = (1..=5).map(mk).collect();
+    app.timeframe = crate::history::Tf::D1;
+    for (w, h) in [(60, 20), (120, 40), (200, 50)] {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let area = Rect::new(0, 0, w, h);
+        let rects = hit_rects(&app.hits);
+        for (i, a) in rects.iter().enumerate() {
+            assert_eq!(a.intersection(area), *a, "{a:?} outside {w}x{h}");
+            assert!(rects[i + 1..].iter().all(|b| !a.intersects(*b)), "{a:?} overlaps at {w}x{h}");
+        }
+        let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        // (the header tabs need the width)
+        assert!((w < 120 || text.contains(" Mine ")) && text.contains("BUBBLES") && text.contains("CHART"), "{w}x{h}");
+        // the chart's keys work here: it shows the chart
+        assert!(app.hits.chart_cols > 0 || w < 100);
+    }
+    // w cycles into the custom tab and out again
+    app.cfg.layout = Layout::Alerts;
+    app.on_key(crossterm::event::KeyEvent::new(KeyCode::Char('w'), crossterm::event::KeyModifiers::NONE));
+    assert_eq!(app.cfg.layout, Layout::Custom1);
+}
+
+#[test]
+fn on_screen_editor_drops_widgets_and_drags_borders() {
+    use crate::config::Layout;
+    use crate::layouts::{CustomLayout, Panel, Template};
+    use crossterm::event::{KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let (htx, _hrx) = std::sync::mpsc::channel();
+    let tab = CustomLayout { on: true, name: "Mine".into(), template: Template::Columns, slots: vec![Panel::Chart, Panel::Empty], splits: vec![50] };
+    let cfg = Config { custom_layouts: vec![tab], layout: Layout::Custom1, ..Config::default() };
+    let mut app = App::new(cfg, "target/test-config/unused-edit-config.json".into(), tx, htx, None);
+    app.view = View::Dashboard;
+    app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+    assert!(app.view == View::LayoutEdit);
+    let mut term = Terminal::new(TestBackend::new(160, 40)).unwrap();
+    let mouse = |app: &mut App, kind, x, y| app.on_mouse(MouseEvent { kind, column: x, row: y, modifiers: KeyModifiers::NONE });
+    term.draw(|f| draw(f, &mut app)).unwrap();
+    let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+    assert!(text.contains("Slot B: drop a widget here") && text.contains("EDIT Mine"));
+    // carry Bubbles from the toolbar into slot B
+    let (w, _) = *app.hits.edit_widgets.iter().find(|w| w.1 == Panel::Bubbles).unwrap();
+    let (b, _) = *app.hits.edit_slots.iter().find(|s| s.1 == 1).unwrap();
+    mouse(&mut app, MouseEventKind::Down(MouseButton::Left), w.x, w.y);
+    mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), b.x + 5, b.y + 5);
+    term.draw(|f| draw(f, &mut app)).unwrap();
+    mouse(&mut app, MouseEventKind::Up(MouseButton::Left), b.x + 5, b.y + 5);
+    assert_eq!(app.layout_draft().slots, vec![Panel::Chart, Panel::Bubbles]);
+    // drag the border to 30% of the width
+    term.draw(|f| draw(f, &mut app)).unwrap();
+    let (h, ..) = app.hits.edit_handles[0];
+    mouse(&mut app, MouseEventKind::Down(MouseButton::Left), h.x, h.y + 3);
+    mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 48, h.y + 3);
+    mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 48, h.y + 3);
+    assert_eq!(app.layout_draft().splits, vec![30]);
+    // a template chip switches the arrangement, keeping the widgets
+    term.draw(|f| draw(f, &mut app)).unwrap();
+    let (t, _) = *app.hits.edit_templates.iter().find(|t| t.1 == Template::Rows).unwrap();
+    mouse(&mut app, MouseEventKind::Down(MouseButton::Left), t.x, t.y);
+    assert_eq!((app.layout_draft().template, app.layout_draft().slots.clone()), (Template::Rows, vec![Panel::Chart, Panel::Bubbles]));
+    // nothing saved until Enter; Enter saves and shows the tab
+    assert_eq!(app.cfg.custom_layouts[0].slots, vec![Panel::Chart, Panel::Empty]);
+    app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(app.view == View::Dashboard);
+    assert_eq!(app.cfg.custom_layouts[0].template, Template::Rows);
+    assert_eq!(app.cfg.layout, Layout::Custom1);
+    // Esc drops the changes made in the editor
+    app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+    term.draw(|f| draw(f, &mut app)).unwrap();
+    let (s, _) = app.hits.edit_slots[0];
+    mouse(&mut app, MouseEventKind::Down(MouseButton::Right), s.x + 2, s.y + 2);
+    assert_eq!(app.layout_draft().slots[0], Panel::Empty);
+    app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(app.cfg.custom_layouts[0].slots, vec![Panel::Chart, Panel::Bubbles]);
+}

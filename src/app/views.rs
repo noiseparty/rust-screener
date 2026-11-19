@@ -4,10 +4,11 @@
 pub const APP_NAME: &str = crate::paths::APP_DIR_NAME;
 pub const BOOT_ITEMS: [&str; 2] = ["Start MarketGUI", "Config"];
 /// Config sidebar items and their descriptions.
-pub const SETUP_ITEMS: [(&str, &str); 9] = [
+pub const SETUP_ITEMS: [(&str, &str); 10] = [
     ("Configuration", "Thresholds, filters and windows, with live filter preview"),
     ("Presets", "Saved configurations: load one into Configuration, save the current one"),
     ("Theme", "Colour theme: browse with a live dashboard preview, Enter keeps it"),
+    ("Layouts", "Your own dashboard tabs: pick an arrangement and a panel for each slot"),
     ("Time & Format", "Time zone, date and clock, currency and number formats, with a live preview"),
     ("Blacklist", "Hide tickers from ranking (still tracked, listed separately)"),
     ("Alert Filters", "Which alert types appear under ALL and in the f cycle"),
@@ -16,10 +17,11 @@ pub const SETUP_ITEMS: [(&str, &str); 9] = [
     ("Health Check", "Connection checks for the network and the stock data source"),
 ];
 /// The settings pane (#2) of each sidebar item, in `SETUP_ITEMS` order.
-pub const SETUP_VIEWS: [View; 9] = [
+pub const SETUP_VIEWS: [View; 10] = [
     View::SetupConfig,
     View::Presets,
     View::SetupTheme,
+    View::SetupLayouts,
     View::SetupFormat,
     View::SetupBlacklist,
     View::SetupFilters,
@@ -51,6 +53,10 @@ pub enum View {
     SetupSound,
     /// Config -> Time & Format: time zone, date, clock and number formats.
     SetupFormat,
+    /// Config -> Layouts: the user's own dashboard tabs.
+    SetupLayouts,
+    /// A custom tab edited on screen with the mouse, full size and live.
+    LayoutEdit,
 }
 
 /// A Presets action waiting for `y`.

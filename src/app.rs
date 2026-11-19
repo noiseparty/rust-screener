@@ -6,6 +6,7 @@ use crate::engine::{AlertKind, Candle, Engine, Filters};
 use crate::fmt::{self, Formats};
 use crate::health::CheckResult;
 use crate::history::{self, Tf};
+use crate::layouts::{CustomLayout, Panel};
 use crate::levels;
 use crate::presets;
 use crate::scraper::{self, Fetched, Float, Ticker};
@@ -26,11 +27,13 @@ mod chart_view;
 mod feeds;
 mod fields;
 mod keys;
+mod layout_edit;
 mod setup;
 mod views;
 
 use chart_view::Drag;
 pub use chart_view::Hits;
+pub use layout_edit::{layout_rows, LayoutRow};
 use fields::{config_from_inputs, cycle_choice, inputs_from, on_off};
 pub use fields::{field_index, filters_from_inputs, FieldId, FieldKind, COLUMNS, FIELDS};
 pub use views::{DebugView, PresetAsk, View, APP_NAME, BL_COLS, BOOT_ITEMS, SETUP_ITEMS, SETUP_VIEWS, VOLUME_STEP};
@@ -169,6 +172,15 @@ pub struct App {
     pub filter_cursor: usize,
     /// Config -> Sound: 0 = the Mute row, 1 = the Volume row.
     pub sound_cursor: usize,
+    /// Config -> Layouts: the custom tabs being edited, which one, and the focused row.
+    pub layouts_draft: Vec<CustomLayout>,
+    pub layouts_tab: usize,
+    pub layouts_cursor: usize,
+    /// On-screen layout editor: the drafts to restore on Esc, the view to go back to, and the
+    /// pointer while a widget is carried.
+    layout_edit_undo: Option<Vec<CustomLayout>>,
+    layout_edit_back: View,
+    pub drag_pos: Option<Position>,
     /// Config -> Time & Format: the formats being edited (shown everywhere while the item is
     /// selected) and the focused row of `fmt::ROWS`.
     pub fmt_draft: Formats,
@@ -282,6 +294,11 @@ pub struct App {
     pub plot: Option<crate::chart::Plot>,
     /// Halftone art the window app paints as dots under the cells (boot scene, cog).
     pub halftones: Vec<(Rect, crate::art::Halftone)>,
+    /// Bubbles the window app paints over the cells (the Bubbles layout).
+    pub bubbles: Vec<crate::bubbles::Painted>,
+    /// Where the bubbles are, kept between frames, and when they last moved.
+    pub bubble_field: crate::bubbles::Field,
+    pub bubbles_at: Option<Instant>,
     /// Trace mode's debug overlay on the dashboard.
     pub debug: DebugView,
 }
@@ -343,6 +360,12 @@ impl App {
             bl_err: None,
             filter_cursor: 0,
             sound_cursor: 0,
+            layouts_draft: vec![CustomLayout::default(); crate::layouts::MAX],
+            layouts_tab: 0,
+            layouts_cursor: 0,
+            layout_edit_undo: None,
+            layout_edit_back: View::Dashboard,
+            drag_pos: None,
             fmt_draft,
             fmt_cursor: 0,
             preset_formats: None,
@@ -408,6 +431,9 @@ impl App {
             pixel_chart: false,
             plot: None,
             halftones: Vec::new(),
+            bubbles: Vec::new(),
+            bubble_field: Default::default(),
+            bubbles_at: None,
             debug: DebugView { on: crate::trace::enabled(), ..DebugView::default() },
         }
     }

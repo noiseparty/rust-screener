@@ -7,6 +7,10 @@ use super::*;
 pub(super) enum Drag {
     Plot { x: u16, y: u16, pan: i64, shift: f64 },
     Axis { y: u16, zoom: f64 },
+    /// Layout editor: a widget carried from the toolbar or from slot `from`.
+    Widget { panel: Panel, from: Option<usize> },
+    /// Layout editor: split `i`'s border, dividing `parent` into columns (`cols`) or rows.
+    Split { i: usize, parent: Rect, cols: bool },
 }
 
 /// Screen areas the mouse can act on, recorded by the last draw.
@@ -33,6 +37,12 @@ pub struct Hits {
     pub chart_cols: u16,
     /// Config sidebar rows and their index in `SETUP_ITEMS`.
     pub setup_items: Vec<(Rect, usize)>,
+    /// Layout editor: slots, split borders (with the area they divide and the direction),
+    /// widget chips, template chips and custom tab chips.
+    pub edit_slots: Vec<(Rect, usize)>,
+    pub edit_handles: Vec<(Rect, usize, Rect, bool)>,
+    pub edit_widgets: Vec<(Rect, Panel)>,
+    pub edit_templates: Vec<(Rect, crate::layouts::Template)>,
 }
 
 impl App {
@@ -257,6 +267,10 @@ impl App {
     }
 
     pub fn on_mouse(&mut self, m: MouseEvent) {
+        if self.view == View::LayoutEdit {
+            self.layout_mouse(m);
+            return;
+        }
         if !matches!(self.view, View::Dashboard | View::Chart) && !self.in_setup() {
             return;
         }
@@ -293,7 +307,8 @@ impl App {
                 let rows = i32::from(p.y) - i32::from(y);
                 self.zoom = (zoom * 1.06f64.powi(rows)).clamp(0.05, 20.0);
             }
-            None => {}
+            Some(Drag::Split { i, parent, cols }) => self.drag_split(i, parent, cols, p),
+            Some(Drag::Widget { .. }) | None => {}
         }
     }
 

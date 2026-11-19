@@ -2,12 +2,15 @@
 //! small widgets they share are here.
 
 mod boot;
+mod bubbles;
+mod custom;
 mod dashboard;
 mod debug;
 mod samples;
 mod setup;
 mod setup_panes;
 mod tables;
+mod volume;
 #[cfg(test)]
 mod tests;
 
@@ -59,6 +62,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     app.hits = Hits::default();
     app.plot = None;
     app.halftones.clear();
+    app.bubbles.clear();
     // The boot screen keeps the original colours; everything else follows the theme.
     theme::set(if app.view == View::Boot { theme::NOIR } else { app.palette });
     fmt::set(app.formats());
@@ -70,6 +74,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         View::Dashboard => dashboard(f, app),
         View::Columns => columns(f, app),
         View::Chart => chart_view(f, app),
+        View::LayoutEdit => custom::layout_edit(f, app),
         View::SetupMenu
         | View::SetupConfig
         | View::SetupBlacklist
@@ -79,7 +84,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         | View::Presets
         | View::SetupTheme
         | View::SetupSound
-        | View::SetupFormat => setup_shell(f, app),
+        | View::SetupFormat
+        | View::SetupLayouts => setup_shell(f, app),
     }
     if app.view == View::Dashboard && app.debug.open {
         debug::overlay(f, app, &crate::trace::snapshot().unwrap_or_default());
@@ -87,6 +93,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         // under it takes no clicks
         app.plot = None;
         app.halftones.clear();
+        app.bubbles.clear();
         app.hits = Hits::default();
     }
 }

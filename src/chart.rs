@@ -10,14 +10,14 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 
-fn put(buf: &mut Buffer, area: Rect, x: i32, y: i32, ch: &str, fg: Color) {
+pub(crate) fn put(buf: &mut Buffer, area: Rect, x: i32, y: i32, ch: &str, fg: Color) {
     if x < 0 || y < 0 || x >= area.width as i32 || y >= area.height as i32 {
         return;
     }
     buf[(area.x + x as u16, area.y + y as u16)].set_symbol(ch).set_style(Style::new().fg(fg));
 }
 
-fn text(buf: &mut Buffer, area: Rect, x: i32, y: i32, s: &str, fg: Color) {
+pub(crate) fn text(buf: &mut Buffer, area: Rect, x: i32, y: i32, s: &str, fg: Color) {
     for (i, ch) in s.chars().enumerate() {
         put(buf, area, x + i as i32, y, ch.encode_utf8(&mut [0; 4]), fg);
     }
@@ -224,26 +224,28 @@ pub fn draw(buf: &mut Buffer, area: Rect, symbol: &str, candles: &[Candle], day_
         put(buf, area, gx, plot_bot + 1, "─", pal().grid);
     }
 
-    // 4h swing lines: the 3 open ones nearest the live price in white, every taken one (price
+    // 4h swing lines: the 3 open rows nearest the live price in white, every taken one (price
     // traded above it) dimmed; at the line's start the date and price of the high that set it,
     // in the Time & Format settings, by default "17.11.26 ($3.86)", 4 decimals under $1 (candles drawn later win, open lines over
-    // taken ones). An open line off the plot is a tag on the top or bottom edge instead, e.g.
-    // "▲ 17.11.26 ($3.86)".
-    let mut open: Vec<&Level> = spec.levels.iter().filter(|l| !l.taken).collect();
-    open.sort_by(|a, b| (a.price - live.close).abs().total_cmp(&(b.price - live.close).abs()));
+    // taken ones). Lines that fall on one text row are one line: the newest gives the tag, the
+    // others add " +N", so close lines do not overwrite each other's tag as the price moves. An
+    // open row off the plot is a tag on the top or bottom edge instead, e.g. "▲ 17.11.26 ($3.86)".
+    // a line set after the shown range (scrolled back) is not drawn
+    let shown = spec.levels.iter().filter(|l| !candles.get(last).is_some_and(|c| c.start <= l.at));
+    let (open, taken): (Vec<&Level>, Vec<&Level>) = shown.partition(|l| !l.taken);
+    let mut open = level_rows(&open, &to_y);
+    open.sort_by(|a, b| (a.price - live.close).abs().total_cmp(&(b.price - live.close).abs()).then(a.y.cmp(&b.y)));
     open.truncate(3);
+    let taken: Vec<LevelRow> = level_rows(&taken, &to_y).into_iter().filter(|t| open.iter().all(|o| o.y != t.y)).collect();
     let dim = mix(pal().chart_muted, pal().bg, 0.5);
     let mut edge_tags: Vec<(i32, String)> = Vec::new();
     let (mut n_above, mut n_below) = (0, 0);
-    for l in spec.levels.iter().filter(|l| l.taken).chain(open) {
-        // a line set after the shown range (scrolled back) is not drawn
-        if candles.get(last).is_some_and(|c| c.start <= l.at) {
-            continue;
-        }
-        let y = to_y(l.price);
-        let tag = format!("{} ({})", fmt::date(l.at), fmt::money(l.price));
+    for (r, is_open) in taken.iter().map(|r| (r, false)).chain(open.iter().map(|r| (r, true))) {
+        let y = r.y;
+        let more = if r.n > 1 { format!(" +{}", r.n - 1) } else { String::new() };
+        let tag = format!("{} ({}){more}", fmt::date(r.at), fmt::money(r.price));
         if !(plot_top..=plot_bot).contains(&y) {
-            if !l.taken {
+            if is_open {
                 let above = y < plot_top;
                 let row = if above { plot_top + n_above } else { plot_bot - n_below };
                 *(if above { &mut n_above } else { &mut n_below }) += 1;
@@ -251,8 +253,8 @@ pub fn draw(buf: &mut Buffer, area: Rect, symbol: &str, candles: &[Candle], day_
             }
             continue;
         }
-        let x0 = left + view.partition_point(|c| c.start <= l.at).saturating_sub(1) as i32 * step;
-        let col = if l.taken { dim } else { pal().chart_text };
+        let x0 = left + view.partition_point(|c| c.start <= r.first).saturating_sub(1) as i32 * step;
+        let col = if is_open { pal().chart_text } else { dim };
         for gx in x0..=x1 {
             put(buf, area, gx, y, "─", col);
         }
@@ -338,6 +340,38 @@ pub fn draw(buf: &mut Buffer, area: Rect, symbol: &str, candles: &[Candle], day_
     })
 }
 
+/// The swing lines that fall on one text row, drawn as one.
+struct LevelRow {
+    y: i32,
+    /// Date and price of the newest line on the row (its tag).
+    at: i64,
+    price: f64,
+    /// Start of the oldest line on the row (where the drawn line starts).
+    first: i64,
+    /// Lines on the row.
+    n: usize,
+}
+
+/// `lines` grouped by the row `to_y` puts them on, top to bottom.
+fn level_rows(lines: &[&Level], to_y: &dyn Fn(f64) -> i32) -> Vec<LevelRow> {
+    let mut rows: Vec<LevelRow> = Vec::new();
+    for l in lines {
+        let y = to_y(l.price);
+        match rows.iter_mut().find(|r| r.y == y) {
+            Some(r) => {
+                if (l.at, l.price) > (r.at, r.price) {
+                    (r.at, r.price) = (l.at, l.price);
+                }
+                r.first = r.first.min(l.at);
+                r.n += 1;
+            }
+            None => rows.push(LevelRow { y, at: l.at, price: l.price, first: l.at, n: 1 }),
+        }
+    }
+    rows.sort_by_key(|r| r.y);
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,6 +433,28 @@ mod tests {
         let lines = |fg: Color| (2..=15).filter(|&y| buf[(39, y)].symbol() == "─" && buf[(39, y)].fg == fg).count();
         assert_eq!(lines(pal().chart_text), 3);
         assert_eq!(lines(mix(pal().chart_muted, pal().bg, 0.5)), 2);
+    }
+
+    #[test]
+    fn lines_on_one_row_are_one_line_whichever_side_the_price_is() {
+        let area = Rect::new(0, 0, 50, 20);
+        let level = |price, at| Level { price, at, taken: false };
+        // 5.0 and 5.1 share a row (~0.76 per row); 2.0 is the 4th row from the price
+        let levels = [level(5.0, 0), level(5.1, 60), level(7.0, 0), level(3.0, 0), level(2.0, 0)];
+        // (the live price line runs through the tag's gap)
+        let tag = "($5.10) +1";
+        for close in [5.04, 5.06] {
+            let mut candles: Vec<Candle> = (0..20).map(|i| candle(i, 1.0, 10.0)).collect();
+            candles[19].close = close;
+            let mut buf = Buffer::empty(area);
+            draw(&mut buf, area, "A", &candles, 0.0, &spec(0, &levels, true));
+            let rows: Vec<String> = (0..20).map(|y| (0..40).map(|x| buf[(x, y)].symbol().to_string()).collect()).collect();
+            assert_eq!(rows.iter().filter(|r| r.contains(tag)).count(), 1, "{close}: {rows:#?}");
+            // three open rows: 5.x, 7 and 3
+            let open = (2..=15).filter(|&y| buf[(39, y)].symbol() == "─" && buf[(39, y)].fg == pal().chart_text).count();
+            assert_eq!(open, 3, "{close}");
+            assert!(!rows.iter().any(|r| r.contains("($2.00)")), "{close}");
+        }
     }
 
     #[test]

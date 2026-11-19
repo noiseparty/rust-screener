@@ -193,6 +193,7 @@ impl eframe::App for Window {
             if let Some(plot) = &app.plot {
                 paint_plot(ui.painter(), plot, area.min, self.cell, ppp);
             }
+            paint_bubbles(ui.painter(), &app.bubbles, area.min, self.cell, &font);
             let icon = self.icon.get_or_insert_with(|| {
                 let img = egui::ColorImage::from_rgba_unmultiplied([64, 64], include_bytes!("../assets/icon64.rgba"));
                 ctx.load_texture("icon", img, egui::TextureOptions::LINEAR)
@@ -310,6 +311,21 @@ fn paint_plot(painter: &egui::Painter, plot: &crate::chart::Plot, origin: Pos2, 
             let h = snap((c.volume as f64 / plot.max_vol) as f32 * vol_h).max(px);
             let r = Rect::from_min_max(Pos2::new(cx - body_w / 2.0, vol_top + vol_h - h), Pos2::new(cx + body_w / 2.0, vol_top + vol_h));
             painter.rect_filled(r, 0.0, col.gamma_multiply(0.6));
+        }
+    }
+}
+
+/// Bubbles of the Bubbles layout over the cells (blank there): radius in columns, scaled by the
+/// smaller of a column and half a row so neighbours never touch; the label lines centred.
+fn paint_bubbles(painter: &egui::Painter, bubbles: &[crate::bubbles::Painted], origin: Pos2, cell: Vec2, font: &FontId) {
+    let unit = cell.x.min(cell.y / 2.0);
+    for b in bubbles {
+        let centre = origin + Vec2::new(b.cx * cell.x, b.cy * cell.y);
+        painter.circle_filled(centre, b.r * unit, color(b.fill, DEFAULT_FG));
+        let fg = color(b.text, DEFAULT_FG);
+        for (i, s) in b.lines.iter().enumerate() {
+            let pos = centre + Vec2::new(0.0, (i as f32 - 1.0) * cell.y);
+            painter.text(pos, Align2::CENTER_CENTER, s, font.clone(), fg);
         }
     }
 }

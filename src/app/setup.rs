@@ -54,6 +54,7 @@ impl App {
             }
             View::SetupFilters => self.filter_cursor = 0,
             View::SetupSound => self.sound_cursor = 0,
+            View::SetupLayouts => self.reset_layouts_draft(),
             View::SetupFormat => {
                 self.fmt_draft = self.cfg.formats.clone();
                 self.fmt_cursor = 0;
