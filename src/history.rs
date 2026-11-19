@@ -114,6 +114,61 @@ pub fn bar_end(start: i64, tf: Tf) -> i64 {
     cut.map_or(full, |c| full.min(start + (c - m) * 60 - i64::from(t.second())))
 }
 
+/// Start of the bar holding `ts`: the counterpart of `bar_end` (intraday bars counted from
+/// each session's start, a daily bar from New York midnight).
+pub fn period_start(ts: i64, tf: Tf) -> i64 {
+    use chrono::Timelike;
+    let floor = ts - ts.rem_euclid(tf.secs());
+    let Some(t) = nytime::at(ts) else { return floor };
+    if tf == Tf::D1 {
+        return nytime::ts(t.date_naive(), 0, 0).unwrap_or(floor);
+    }
+    let m = i64::from(nytime::minute_of_day(&t));
+    let sess = [REG_CLOSE, REG_OPEN, PRE_OPEN].into_iter().map(i64::from).find(|&s| s <= m);
+    match sess {
+        Some(s) if m < i64::from(AFTER_CLOSE) => {
+            let from = ts - (m - s) * 60 - i64::from(t.second());
+            from + (ts - from) / tf.secs() * tf.secs()
+        }
+        _ => floor,
+    }
+}
+
+/// Brings fetched `bars` up to `now` with the live `price` (0 = none): the bar in progress
+/// takes the price; when Webull has no bar for the current period yet (no trade in it, the
+/// next refresh not in, a daily bar before the open) one is built from the app's own 1m
+/// `minutes` of the period and the price. Webull's bar replaces it once fetched.
+pub fn extend_live(bars: &mut Vec<Candle>, tf: Tf, minutes: impl Iterator<Item = Candle>, price: f64, now: i64) {
+    let start = period_start(now, tf);
+    match bars.last_mut() {
+        Some(last) if last.start >= start => {
+            if last.start == start && price > 0.0 {
+                last.close = price;
+                last.high = last.high.max(price);
+                last.low = last.low.min(price);
+            }
+        }
+        _ => {
+            let mins: Vec<Candle> = minutes.filter(|c| c.start >= start && c.start <= now).collect();
+            let (Some(first), Some(newest)) = (mins.first(), mins.last()) else {
+                if price > 0.0 {
+                    bars.push(Candle { start, open: price, high: price, low: price, close: price, volume: 0 });
+                }
+                return;
+            };
+            let close = if price > 0.0 { price } else { newest.close };
+            bars.push(Candle {
+                start,
+                open: first.open,
+                high: mins.iter().map(|c| c.high).fold(close, f64::max),
+                low: mins.iter().map(|c| c.low).fold(close, f64::min),
+                close,
+                volume: mins.iter().map(|c| c.volume).sum(),
+            });
+        }
+    }
+}
+
 /// One bar line: `label,open,close,high,low,prevClose,volume,vwap`.
 fn parse_bar(s: &str, tf: Tf) -> Option<Candle> {
     let f: Vec<&str> = s.split(',').collect();
@@ -252,6 +307,49 @@ mod tests {
         assert_eq!(h1(ny(16, 0)), ny(15, 30));
         assert_eq!(h1(ny(17, 0)), ny(16, 0));
         assert_eq!(bar_start(ny(10, 1), 60), ny(10, 0));
+    }
+
+    #[test]
+    fn period_start_matches_bar_end() {
+        let ny = |h: i64, m: i64| 1794805200 + h * 3600 + m * 60; // Mon 16 Nov 2026 00:00 NY
+        assert_eq!(period_start(ny(7, 3), Tf::M5), ny(7, 0));
+        assert_eq!(period_start(ny(9, 30), Tf::H1), ny(9, 30));
+        assert_eq!(period_start(ny(9, 29), Tf::H1), ny(9, 0));
+        assert_eq!(period_start(ny(10, 45), Tf::H1), ny(10, 30));
+        assert_eq!(period_start(ny(9, 0), Tf::H4), ny(8, 0));
+        assert_eq!(period_start(ny(13, 30), Tf::H4), ny(13, 30));
+        assert_eq!(period_start(ny(19, 59), Tf::H4), ny(16, 0));
+        assert_eq!(period_start(ny(7, 0), Tf::D1), ny(0, 0));
+        for tf in [Tf::M5, Tf::H1, Tf::H4, Tf::D1] {
+            for t in [ny(4, 0), ny(8, 59), ny(9, 30), ny(12, 7), ny(15, 59), ny(18, 0)] {
+                let s = period_start(t, tf);
+                assert!(s <= t && t < bar_end(s, tf), "{tf:?} {t}");
+            }
+        }
+    }
+
+    #[test]
+    fn live_bar_from_minutes_when_webull_has_none() {
+        let ny = |h: i64, m: i64| 1794805200 + h * 3600 + m * 60;
+        let c = |start, open, high, low, close, volume| Candle { start, open, high, low, close, volume };
+        let yesterday = c(ny(-24, 0), 1.0, 1.2, 0.9, 1.1, 500);
+        let minutes = [c(ny(-1, 0), 9.0, 9.0, 9.0, 9.0, 1), c(ny(7, 0), 1.1, 1.3, 1.05, 1.2, 10), c(ny(7, 1), 1.2, 1.25, 1.0, 1.15, 20)];
+        // pre-market daily: today's bar from today's minutes and the live price
+        let mut bars = vec![yesterday];
+        extend_live(&mut bars, Tf::D1, minutes.into_iter(), 1.4, ny(7, 2));
+        assert_eq!(bars[1], c(ny(0, 0), 1.1, 1.4, 1.0, 1.4, 30));
+        // a bar in progress takes the price; a closed one is left alone
+        let mut bars = vec![c(ny(7, 0), 1.0, 1.1, 0.9, 1.0, 5)];
+        extend_live(&mut bars, Tf::M5, minutes.into_iter(), 1.2, ny(7, 3));
+        assert_eq!(bars, vec![c(ny(7, 0), 1.0, 1.2, 0.9, 1.2, 5)]);
+        // 4h 08:00-09:30 bar after the open: a new 09:30 bar, the old one untouched
+        let mut bars = vec![c(ny(8, 0), 1.0, 1.1, 0.9, 1.0, 5)];
+        extend_live(&mut bars, Tf::H4, std::iter::empty(), 1.5, ny(9, 31));
+        assert_eq!(bars, vec![c(ny(8, 0), 1.0, 1.1, 0.9, 1.0, 5), c(ny(9, 30), 1.5, 1.5, 1.5, 1.5, 0)]);
+        // nothing live: nothing added
+        let mut bars = vec![yesterday];
+        extend_live(&mut bars, Tf::D1, std::iter::empty(), 0.0, ny(7, 2));
+        assert_eq!(bars.len(), 1);
     }
 
     #[test]

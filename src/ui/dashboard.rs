@@ -144,13 +144,11 @@ pub(super) fn chart_panel(f: &mut Frame, app: &mut App, area: Rect, sym: &str) {
         Tf::M1 => app.engine.candles(sym).map(|c| c.iter().copied().collect()).unwrap_or_default(),
         _ => app.bars.get(&(sym.to_string(), tf)).cloned().unwrap_or_default(),
     };
-    // Fetched bars are refreshed every few seconds; the live price keeps the bar in progress current.
-    if let (Tf::M5 | Tf::H1 | Tf::H4 | Tf::D1, Some(t), Some(last)) = (tf, ticker, candles.last_mut()) {
-        if t.price > 0.0 && chrono::Utc::now().timestamp() < last.start + tf.secs() {
-            last.close = t.price;
-            last.high = last.high.max(t.price);
-            last.low = last.low.min(t.price);
-        }
+    // Fetched bars are refreshed every few seconds; the live price and the 1m candles keep the
+    // bar in progress current (and stand in for it until Webull has one).
+    if tf != Tf::M1 && !candles.is_empty() {
+        let minutes = app.engine.candles(sym).into_iter().flatten().copied();
+        crate::history::extend_live(&mut candles, tf, minutes, ticker.map_or(0.0, |t| t.price), chrono::Utc::now().timestamp());
     }
     let empty = match tf {
         Tf::M1 => "Collecting data. Candles appear after the first refresh in each minute.".to_string(),
